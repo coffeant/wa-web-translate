@@ -1,178 +1,306 @@
 // ==UserScript==
-// @name         WhatsApp 智译助手 (对标 TradeMessenger)
-// @namespace    wa-translate-pro
-// @version      1.0.0
-// @description  对标中国制造网 TradeMessenger：接收消息翻译 / 发送实时翻译 / 按联系人AUTO语言 / LLM+术语库翻译 / AI聊天上下文推荐回复。只填入不代发，人工确认后发送。
+// @name         WhatsApp Web 翻译助手
+// @namespace    wa-translate
+// @version      4.0.5
+// @description  中文→多国语言：按客户自动识别语种，输入框一键翻译+发送；划词翻译。零依赖，不装服务。
 // @match        https://web.whatsapp.com/*
 // @grant        GM_xmlhttpRequest
+// @grant        GM_setClipboard
 // @grant        GM_setValue
 // @grant        GM_getValue
-// @grant        GM_deleteValue
-// @grant        GM_setClipboard
 // @grant        GM_registerMenuCommand
 // @connect      clients5.google.com
 // @connect      translate.googleapis.com
 // @connect      api.mymemory.translated.net
-// @connect      api.deepl.com
-// @connect      api-free.deepl.com
 // @connect      api.openai.com
-// @connect      open.bigmodel.cn
 // @connect      api.deepseek.com
-// @connect      api.moonshot.cn
+// @connect      open.bigmodel.cn
 // @connect      dashscope.aliyuncs.com
-// @connect      api.minimaxi.com
-// @connect      api.minimax.chat
-// @connect      openrouter.ai
-// @connect      api.siliconflow.cn
 // @run-at       document-idle
 // ==/UserScript==
 
 (function () {
     'use strict';
 
-    /**************** 工具 ****************/
-    function gmReq(opt) {
+    console.log('[WA翻译助手] v4.0.5 启动');
+
+    var STATE_IDLE = 0, STATE_READY = 1;
+    var state = STATE_IDLE;
+    var lastTranslated = '';
+
+    /* ================= 语言表 ================= */
+    // code = 翻译接口用的代码；short = 按钮上显示的 2 字母
+    var LANGS = [
+        ['en', 'English 英语', 'EN'],
+        ['es', 'Español 西班牙语', 'ES'],
+        ['pt', 'Português 葡萄牙语', 'PT'],
+        ['ru', 'Русский 俄语', 'RU'],
+        ['fr', 'Français 法语', 'FR'],
+        ['de', 'Deutsch 德语', 'DE'],
+        ['it', 'Italiano 意大利语', 'IT'],
+        ['ar', 'العربية 阿拉伯语', 'AR'],
+        ['tr', 'Türkçe 土耳其语', 'TR'],
+        ['id', 'Bahasa Indonesia 印尼语', 'ID'],
+        ['vi', 'Tiếng Việt 越南语', 'VI'],
+        ['th', 'ไทย 泰语', 'TH'],
+        ['pl', 'Polski 波兰语', 'PL'],
+        ['nl', 'Nederlands 荷兰语', 'NL'],
+        ['fa', 'فارسی 波斯语', 'FA'],
+        ['he', 'עברית 希伯来语', 'HE'],
+        ['hi', 'हिन्दी 印地语', 'HI'],
+        ['ja', '日本語 日语', 'JA'],
+        ['ko', '한국어 韩语', 'KO'],
+        ['ms', 'Bahasa Melayu 马来语', 'MS'],
+        ['uk', 'Українська 乌克兰语', 'UK'],
+        ['ro', 'Română 罗马尼亚语', 'RO'],
+        ['el', 'Ελληνικά 希腊语', 'EL'],
+        ['sv', 'Svenska 瑞典语', 'SV'],
+        ['ca', 'Català 加泰罗尼亚语', 'CA'],
+        ['zh-CN', '中文 简体', 'ZH']
+    ];
+    function langShort(c) { for (var i = 0; i < LANGS.length; i++) if (LANGS[i][0] === c) return LANGS[i][2]; return (c || '?').toUpperCase(); }
+    function langName(c) { for (var i = 0; i < LANGS.length; i++) if (LANGS[i][0] === c) return LANGS[i][1]; return c; }
+
+    /* ================= 配置持久化 ================= */
+    var S = Object.assign({
+        txMode: 'auto',        // auto = 跟随客户语言；否则固定为某语言
+        defaultLang: 'en',     // 识别不出时用
+        chatLang: {},          // chatKey -> { lang, manual }
+        sendAfter: true,       // 译完按回车即发送（沿用 v3.16）
+        aiOn: false,           // 可选：用 AI 翻译（更准，需 Key）
+        aiBase: 'https://api.deepseek.com/v1',
+        aiKey: '',
+        aiModel: 'deepseek-chat'
+    }, GM_getValue('cfg4', {}) || {});
+    function saveCfg() { GM_setValue('cfg4', S); }
+
+    /* ================= 翻译接口 ================= */
+    function gmGet(url) {
         return new Promise(function (resolve, reject) {
-            GM_xmlhttpRequest(Object.assign({
-                timeout: 30000,
+            GM_xmlhttpRequest({
+                method: 'GET', url: url, timeout: 10000,
                 onload: function (r) {
                     if (r.status >= 200 && r.status < 300) resolve(r.responseText);
-                    else reject('HTTP ' + r.status + ' ' + String(r.responseText).slice(0, 200));
+                    else reject('HTTP ' + r.status);
                 },
                 onerror: function () { reject('网络错误'); },
                 ontimeout: function () { reject('超时'); }
-            }, opt));
-        });
-    }
-    function gmGet(url) { return gmReq({ method: 'GET', url: url }); }
-    function gmPostJson(url, body, headers) {
-        return gmReq({
-            method: 'POST', url: url,
-            headers: Object.assign({ 'Content-Type': 'application/json' }, headers || {}),
-            data: typeof body === 'string' ? body : JSON.stringify(body)
-        });
-    }
-    function esc(s) { return String(s == null ? '' : s).replace(/[&<>"']/g, function (c) { return ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' })[c]; }); }
-    function sleep(ms) { return new Promise(function (r) { setTimeout(r, ms); }); }
-    function hashStr(s) { var h = 0, i; for (i = 0; i < s.length; i++) { h = ((h << 5) - h + s.charCodeAt(i)) | 0; } return 'h' + (h >>> 0).toString(36); }
-
-    /**************** 设置 ****************/
-    var DEFAULTS = {
-        rxEnabled: true, rxLang: 'zh-CN',
-        txEnabled: true, txLang: 'auto', txDefaultLang: 'en',
-        engine: 'llm',                       // llm | deepl | free | auto
-        llmBase: 'https://api.openai.com/v1', llmKey: '', llmModel: 'gpt-4o-mini',
-        deeplKey: '', freeFallback: true,
-        glossary: [
-            'M8=','SS304=','M8 tapped=','MOQ=','FOB=',
-            'MOQ|最小起订量', 'FOB|离岸价', 'SS304|不锈钢304',
-            'hex bolt|六角螺栓', 'nut|螺母', 'washer|垫圈'
-        ].join('\n'),
-        aiPersona: '我是五金紧固件出口商，专业、友好、简洁。回复围绕报价、交期、规格确认推进订单。',
-        aiCount: 3, aiContextN: 30,
-        contactLang: {}                       // contactKey -> 'en'...
-    };
-    var settings = Object.assign({}, DEFAULTS, GM_getValue('cfg', {}) || {});
-    function saveCfg() { GM_setValue('cfg', settings); }
-    var tmCache = GM_getValue('tm', {}) || {};
-    function saveTM() { var k = Object.keys(tmCache); if (k.length > 800) { k.slice(0, 200).forEach(function (x) { delete tmCache[x]; }); } GM_setValue('tm', tmCache); }
-
-    var LANGS = [
-        ['zh-CN', '中文(简体)'], ['en', 'English'], ['es', 'Español'], ['fr', 'Français'],
-        ['de', 'Deutsch'], ['ru', 'Русский'], ['ar', 'العربية'], ['pt', 'Português'],
-        ['ja', '日本語'], ['ko', '한국어'], ['th', 'ไทย'], ['vi', 'Tiếng Việt'],
-        ['id', 'Indonesia'], ['tr', 'Türkçe'], ['it', 'Italiano'], ['nl', 'Nederlands'],
-        ['pl', 'Polski'], ['hi', 'हिन्दी']
-    ];
-    function langName(c) { for (var i = 0; i < LANGS.length; i++) if (LANGS[i][0] === c) return LANGS[i][1]; return c; }
-    function detectLangHeuristic(t) {
-        var s = t || '';
-        if (/[\u4e00-\u9fff]/.test(s)) return /[\u3040-\u30ff]/.test(s) ? 'ja' : 'zh-CN';
-        if (/[\uac00-\ud7af]/.test(s)) return 'ko';
-        if (/[\u0600-\u06ff]/.test(s)) return 'ar';
-        if (/[\u0400-\u04ff]/.test(s)) return 'ru';
-        if (/[\u0e00-\u0e7f]/.test(s)) return 'th';
-        if (/[\u0900-\u097f]/.test(s)) return 'hi';
-        if (/[\u0590-\u05ff]/.test(s)) return 'he';
-        if (/[\u0370-\u03ff]/.test(s)) return 'el';
-        return 'en';
-    }
-
-    /**************** 翻译引擎 ****************/
-    function buildSystemPrompt(src, tgt) {
-        var gl = (settings.glossary || '').split('\n').map(function (l) { return l.trim(); }).filter(Boolean);
-        var glTxt = gl.length ? '\n术语对照表(禁止译错，保持原样或按表翻译):\n' + gl.join('\n') : '';
-        return '你是专业的外贸翻译引擎。把用户文本从' + (src || '自动检测语种') + '翻译成' + langName(tgt) + '(' + tgt + ')。' +
-            '要求：只输出译文本身，不要解释、不要引号、不要标注语言；保留数字、规格型号、单位、货币缩写、URL、邮件地址原样；标点按目标语言习惯。' + glTxt;
-    }
-    function llmTranslate(text, src, tgt) {
-        var base = (settings.llmBase || 'https://api.openai.com/v1').replace(/\/+$/, '');
-        return gmPostJson(base + '/chat/completions', {
-            model: settings.llmModel || 'gpt-4o-mini',
-            temperature: 0.2,
-            messages: [
-                { role: 'system', content: buildSystemPrompt(src, tgt) },
-                { role: 'user', content: text }
-            ]
-        }, { 'Authorization': 'Bearer ' + (settings.llmKey || '') }).then(function (r) {
-            var j = JSON.parse(r);
-            var out = j.choices && j.choices[0] && j.choices[0].message && j.choices[0].message.content;
-            if (!out) throw new Error('LLM返回为空');
-            return { text: out.trim(), engine: 'LLM' };
-        });
-    }
-    function deeplTranslate(text, src, tgt) {
-        var tgtD = tgt === 'zh-CN' ? 'ZH' : tgt.toUpperCase();
-        var params = 'text=' + encodeURIComponent(text) + '&target_lang=' + tgtD + '&source_lang=' + (src && src !== 'auto' ? src.toUpperCase() : '');
-        if (src === 'zh-CN' || !src) params = 'text=' + encodeURIComponent(text) + '&target_lang=' + tgtD;
-        return gmPostJson((settings.deeplPro ? 'https://api.deepl.com' : 'https://api-free.deepl.com') + '/v2/translate',
-            params, { 'Authorization': 'DeepL-Auth-Key ' + (settings.deeplKey || ''), 'Content-Type': 'application/x-www-form-urlencoded' })
-            .then(function (r) { var j = JSON.parse(r); if (!j.translations || !j.translations[0]) throw new Error('deepl'); return { text: j.translations[0].text, engine: 'DeepL' }; });
-    }
-    function googleFree(text, src, tgt) {
-        return gmGet('https://clients5.google.com/translate_a/t?client=dict-chrome-ex&sl=' + (src || 'auto') + '&tl=' + tgt + '&q=' + encodeURIComponent(text))
-            .then(function (r) { return { text: parseDict(r), engine: 'Google' }; })
-            .catch(function () {
-                var pair = (src || 'en') + '|' + tgt;
-                return gmGet('https://api.mymemory.translated.net/get?q=' + encodeURIComponent(text) + '&langpair=' + pair)
-                    .then(function (r) { var j = JSON.parse(r); return { text: (j.responseData && j.responseData.translatedText) || '', engine: 'MyMemory' }; });
             });
+        });
+    }
+    function gmPostJson(url, body, headers) {
+        return new Promise(function (resolve, reject) {
+            GM_xmlhttpRequest({
+                method: 'POST', url: url, timeout: 60000,
+                headers: Object.assign({ 'Content-Type': 'application/json' }, headers || {}),
+                data: JSON.stringify(body),
+                onload: function (r) {
+                    if (r.status >= 200 && r.status < 300) resolve(r.responseText);
+                    else reject('HTTP ' + r.status + ' ' + String(r.responseText).slice(0, 120));
+                },
+                onerror: function () { reject('网络错误'); },
+                ontimeout: function () { reject('超时'); }
+            });
+        });
     }
     function parseDict(json) {
-        var j = JSON.parse(json), seg = (j && j[0]) || [], out = '';
-        for (var i = 0; i < seg.length; i++) { if (typeof seg[i] === 'string') out += seg[i]; else if (seg[i] && seg[i][0]) out += seg[i][0]; }
-        return out.trim();
-    }
-    // 主入口：TM缓存 → 引擎链 → 兜底
-    function translateSmart(text, src, tgt) {
-        text = String(text || '').trim();
-        if (!text) return Promise.resolve({ text: '', engine: '-' });
-        var tgtF = tgt || 'zh-CN';
-        var key = hashStr(text + '|' + tgtF + '|' + (settings.glossary || '').slice(0, 50));
-        if (tmCache[key]) return Promise.resolve({ text: tmCache[key], engine: 'TM' });
-        var chain = [];
-        if (settings.engine === 'llm' && settings.llmKey) chain.push(function () { return llmTranslate(text, src, tgtF); });
-        if (settings.engine === 'deepl' && settings.deeplKey) chain.push(function () { return deeplTranslate(text, src, tgtF); });
-        if (settings.engine !== 'free') {
-            if (settings.llmKey) chain.push(function () { return llmTranslate(text, src, tgtF); });
-            if (settings.deeplKey) chain.push(function () { return deeplTranslate(text, src, tgtF); });
-        }
-        if (settings.engine === 'llm' || settings.engine === 'deepl' || settings.engine === 'auto' || settings.engine === 'free' || settings.freeFallback) {
-            chain.push(function () { return googleFree(text, src, tgtF); });
-        }
-        function run(i) {
-            if (i >= chain.length) return Promise.reject(new Error('全部引擎失败'));
-            return chain[i]().catch(function () { return run(i + 1); });
-        }
-        return run(0).then(function (r) {
-            if (r && r.text && r.engine !== 'TM') {
-                tmCache[key] = r.text; saveTM();
+        var j = JSON.parse(json);
+        var seg = (j && j[0]) || [];
+        if (typeof seg === 'string') return seg;
+        var out = '';
+        for (var i = 0; i < seg.length; i++) {
+            var item = seg[i];
+            if (typeof item === 'string') {
+                // 末尾的 "zh-CN"/"pt" 是接口返回的原文语种标记，不是译文，丢掉
+                if (i === seg.length - 1 && /^[a-z]{2,3}(-[A-Za-z]{2,4})?$/.test(item)) continue;
+                out += item;
+            } else if (item && item[0]) {
+                out += item[0];
             }
-            return r;
+        }
+        out = out.trim();
+        if (!out) throw new Error('empty');
+        return out;
+    }
+    function parseMM(json) {
+        var j = JSON.parse(json);
+        var t = j.responseData && j.responseData.translatedText;
+        if (!t) throw new Error('mymemory:empty');
+        return t;
+    }
+    // 免费机翻：Google 主，MyMemory 兜底
+    function mtTranslate(text, sl, tl) {
+        var q = encodeURIComponent(text);
+        return gmGet('https://clients5.google.com/translate_a/t?client=dict-chrome-ex&sl=' + sl + '&tl=' + tl + '&q=' + q)
+            .then(parseDict)
+            .catch(function (err1) {
+                var pair = sl === 'auto' ? 'en|' + tl : (sl + '|' + tl);
+                return gmGet('https://api.mymemory.translated.net/get?q=' + q + '&langpair=' + pair)
+                    .then(parseMM)
+                    .catch(function (err2) { throw new Error(err1 + ' / ' + err2); });
+            });
+    }
+    // 可选：AI 翻译（外贸术语更准）
+    function aiTranslate(text, tl) {
+        var sys = '你是专业外贸翻译。把用户文本翻译成 ' + langName(tl) + '(' + tl + ')。' +
+            '只输出译文本身，不要解释、不要引号；数字、规格型号(M10x1.5/DIN 933/SS304)、单位、货币、URL、邮箱保持原样；' +
+            '语气按商务习惯，简洁专业。五金紧固件术语要准确：六角螺栓=hex bolt，螺母=nut，垫圈=washer，牙条=threaded rod，' +
+            '铆钉=rivet，销=pin，喉箍=hose clamp，管夹=pipe clamp，镀锌=zinc plated，不锈钢304=SS304。';
+        return gmPostJson(S.aiBase.replace(/\/+$/, '') + '/chat/completions', {
+            model: S.aiModel || 'deepseek-chat',
+            temperature: 0.2,
+            messages: [{ role: 'system', content: sys }, { role: 'user', content: text }]
+        }, { 'Authorization': 'Bearer ' + S.aiKey }).then(function (r) {
+            var j = JSON.parse(r);
+            var out = j.choices && j.choices[0] && j.choices[0].message && j.choices[0].message.content;
+            if (!out) throw new Error('AI 返回为空');
+            return out.trim();
         });
     }
+    function translateSmart(text, tl) {
+        if (S.aiOn && S.aiKey) {
+            return aiTranslate(text, tl).catch(function (e) {
+                console.warn('[WA翻译助手] AI 翻译失败，退回机翻:', e);
+                return mtTranslate(text, 'auto', tl);
+            });
+        }
+        return mtTranslate(text, 'auto', tl);
+    }
 
-    /**************** WhatsApp DOM 助手 ****************/
+    /* ================= 会话语种识别（纯本地） ================= */
+    var STOP = {
+        es: 'el los las del al una pero muy gracias necesito cuanto precio quiero piezas hola buenos dias senor tambien donde cual tienes ocupo',
+        pt: 'os as um uma nao obrigado preco ola preciso voce qual quanto pecas gostaria bom dia tudo tambem onde',
+        fr: 'le la les de des du que et en un une pour par avec est ne pas ce qui au bonjour merci prix besoin',
+        de: 'der die das und ist nicht ein eine fur mit von den zu sich auf dem preis bitte danke brauche',
+        it: 'il lo la gli le di che e in un una per con del al non si come piu grazie prezzo ho bisogno',
+        nl: 'de het een en van is niet voor met dat op te zijn prijs bedankt alstublieft',
+        en: 'the and is are for with you we can this that have please price thanks would your need send',
+        tr: 've bir bu icin ile degil var fiyat tesekkur lutfen ne kadar lazim merhaba',
+        id: 'dan yang di ini itu untuk dengan tidak saya kami harga terima kasih butuh',
+        pl: 'i w na z do nie jest to ze sie dla cena dziekuje prosze potrzebuje',
+        vi: 'va cua la cho khong co gia cam on bao nhieu can',
+        ro: 'si in de la cu nu este pentru pret multumesc va rog',
+        sv: 'och att det som ar for med inte jag pris tack behover',
+        ca: 'el la els les de que i en un una per amb del al es no si com gratis preu'
+    };
+    function deaccent(s) {
+        try {
+            return s.normalize('NFD').replace(/[\u0300-\u036f]/g, '')
+                .replace(/[ıİ]/g, 'i').replace(/ł/g, 'l').replace(/đ|ð/g, 'd').replace(/ß/g, 'ss');
+        } catch (e) { return s; }
+    }
+    function wordTokens(t) { return (deaccent(t.toLowerCase()).match(/[a-z]+/g) || []); }
+
+    // texts: 该会话最近若干条"对方"消息
+    function detectLang(texts) {
+        var blob = (texts || []).join(' ').toLowerCase();
+        if (!blob) return null;
+        if (/[\u4e00-\u9fff]/.test(blob)) return 'zh-CN';
+        if (/[\u3040-\u30ff]/.test(blob)) return 'ja';
+        if (/[\uac00-\ud7af]/.test(blob)) return 'ko';
+        if (/[\u0600-\u06ff]/.test(blob)) return /[\u06a9]/.test(blob) ? 'fa' : 'ar';
+        if (/[\u0590-\u05ff]/.test(blob)) return 'he';
+        if (/[\u0e00-\u0e7f]/.test(blob)) return 'th';
+        if (/[\u0900-\u097f]/.test(blob)) return 'hi';
+        if (/[\u0370-\u03ff]/.test(blob)) return 'el';
+        if (/[\u0400-\u04ff]/.test(blob)) {
+            // 乌克兰语特征字母
+            if (/[іїєґ]/.test(blob)) return 'uk';
+            return 'ru';
+        }
+        var words = wordTokens(blob);
+        if (!words.length) return null;
+        var best = null, bestHit = 0;
+        for (var code in STOP) {
+            var pool = STOP[code].split(' '), hit = 0;
+            for (var i = 0; i < words.length; i++) if (pool.indexOf(words[i]) > -1) hit++;
+            if (hit > bestHit) { best = code; bestHit = hit; }
+        }
+        if (!best || bestHit === 0) return null;      // 认不出就别乱设
+        if (bestHit < 2 && blob.length < 40) return null;   // 证据太弱，保持原判断
+        return best;
+    }
+
+    /* ================= WhatsApp 上下文 ================= */
+    function chatKey() {
+        var n = document.querySelector('#main [data-id^="false_"], #main [data-id^="true_"]');
+        if (n) {
+            var p = (n.getAttribute('data-id') || '').split('_');
+            if (p.length >= 3 && /@/.test(p[1])) return p[1];
+        }
+        var t = document.querySelector('#main header span[title]');
+        return t ? 'title:' + t.getAttribute('title') : 'unknown';
+    }
+    // 消息节点：四层兜底，任何版式的 WhatsApp 都能取到（排除输入框里的草稿）
+    function inComposer(el) {
+        try { return !!(el.closest && el.closest('footer')); } catch (e) { return false; }
+    }
+    function msgSource() {
+        var a = document.querySelectorAll('#main [data-id^="false_"]');
+        if (a.length) return a;
+        a = document.querySelectorAll('#main .message-in');
+        if (a.length) return a;
+        var raw = document.querySelectorAll('#main .selectable-text');
+        if (raw.length) {
+            var out = [];
+            for (var i = 0; i < raw.length; i++) if (!inComposer(raw[i])) out.push(raw[i]);
+            if (out.length) return out;
+        }
+        var rows = document.querySelectorAll('#main div[role="row"]'), out2 = [];
+        for (var j = 0; j < rows.length; j++) if (!inComposer(rows[j])) out2.push(rows[j]);
+        return out2;
+    }
+    function stripNoise(s) {
+        return (s || '')
+            .replace(/\d{1,2}:\d{2}(\s*[APap][Mm])?/g, ' ')
+            .replace(/\s+/g, ' ')
+            .trim();
+    }
+    function isJunk(t) {
+        return /end-to-end encrypted|Messages and calls|Learn more|deleted this message|waiting for this message|已加密|端到端/i.test(t);
+    }
+    function incomingTexts(n) {
+        var arr = [], nodes = msgSource();
+        for (var i = Math.max(0, nodes.length - (n || 8)); i < nodes.length; i++) {
+            var box = nodes[i].querySelector ? (nodes[i].querySelector('.selectable-text') || nodes[i]) : nodes[i];
+            var t = stripNoise(box.innerText || box.textContent || '');
+            if (t.length > 2 && !isJunk(t)) arr.push(t);
+        }
+        return arr;
+    }
+    var lastKey = '', lastSig = '';
+    function refreshChatLang() {
+        var k = chatKey();
+        var cur = S.chatLang[k];
+        var nodes = msgSource();
+        var tail = nodes.length ? stripNoise((nodes[nodes.length - 1].innerText || '')).slice(0, 80) : '';
+        var sig = k + '#' + nodes.length + '#' + tail;
+        if (sig === lastSig) return;
+        if (k !== lastKey) {                    // 切会话：清掉上一会话的"可回车发送"状态
+            state = STATE_IDLE;
+            lastTranslated = '';
+            paintBtn();
+        }
+        lastKey = k; lastSig = sig;
+        if (cur && cur.manual) return;          // 手动指定过就不自动改
+        var lang = detectLang(incomingTexts(12));
+        if (!lang) return;
+        if (!cur || cur.lang !== lang) {
+            S.chatLang[k] = { lang: lang, manual: false };
+            saveCfg();
+            paintBtn();
+        }
+    }
+
+    // 当前该发什么语言
+    function targetLang() {
+        if (S.txMode !== 'auto') return S.txMode;
+        var c = S.chatLang[chatKey()];
+        return (c && c.lang) || S.defaultLang;
+    }
+
+    /* ================= 输入框定位 ================= */
     function findEditor() {
         var sels = [
             'footer div[contenteditable="true"]',
@@ -183,25 +311,18 @@
         for (var i = 0; i < sels.length; i++) { var el = document.querySelector(sels[i]); if (el) return el; }
         return null;
     }
-    function currentContactKey() {
-        var h = document.querySelector('#main header');
-        if (h) {
-            var t = h.querySelector('span[title], [title]');
-            if (t && t.getAttribute('title')) return t.getAttribute('title');
-        }
-        var info = document.querySelector('[data-testid="conversation-info-header"], [data-testid="conversation-panel-header"]');
-        if (info) return (info.innerText || '').split('\n')[0].trim() || 'unknown';
-        return 'unknown';
-    }
-    function currentTxLang() {
-        if (settings.txLang !== 'auto') return settings.txLang;
-        var ck = currentContactKey();
-        return (settings.contactLang && settings.contactLang[ck]) || settings.txDefaultLang || 'en';
-    }
-    // Lexical 输入框注入（沿用旧脚本验证过的链路）
+
+    /* ================= 替换输入框内容（Lexical 注入，沿用 v3.16 验证过的链路） ================= */
+    function curText() { var l = findEditor(); return l ? ((l.innerText || '').trim()) : ''; }
     function norm(s) { return (s || '').replace(/\s+/g, ' ').trim(); }
     function countOf(hay, needle) { var n = 0, i = hay.indexOf(needle); while (i > -1) { n++; i = hay.indexOf(needle, i + needle.length); } return n; }
-    function curText() { var l = findEditor(); return l ? ((l.innerText || '').trim()) : ''; }
+    function isTarget(oldText, newText) {
+        var it = curText();
+        if (!it) return false;
+        if (norm(it).indexOf(norm(oldText)) > -1) return false;
+        return countOf(norm(it), norm(newText)) === 1;
+    }
+    function sleep(ms) { return new Promise(function (r) { setTimeout(r, ms); }); }
     function syncSelection(editor) {
         document.execCommand('selectAll', false, null);
         try {
@@ -214,349 +335,345 @@
         editor.dispatchEvent(new MouseEvent('mouseup', { bubbles: true, cancelable: true, button: 0 }));
     }
     function pasteInto(editor, text) {
-        var dt = new DataTransfer(); dt.setData('text', text); dt.setData('text/plain', text);
+        var dt = new DataTransfer();
+        dt.setData('text', text); dt.setData('text/plain', text);
         editor.dispatchEvent(new ClipboardEvent('paste', { clipboardData: dt, bubbles: true, cancelable: true }));
     }
-    async function fillEditor(text) {
+    async function replaceEditorText(editor, newText, oldText) {
+        if (isTarget(oldText, newText)) return true;
         for (var round = 0; round < 2; round++) {
             var l = findEditor(); if (!l) return false;
             try { l.focus(); } catch (e) {}
             try { syncSelection(l); } catch (e) {}
-            try { pasteInto(l, text); } catch (e) {}
+            try {
+                l.dispatchEvent(new KeyboardEvent('keydown', {
+                    key: 'a', code: 'KeyA', keyCode: 65, which: 65, ctrlKey: true,
+                    bubbles: true, cancelable: true, composed: true
+                }));
+            } catch (e) {}
+            try { pasteInto(findEditor() || l, newText); } catch (e) {}
             await sleep(300);
-            var now = norm(curText());
-            if (now && countOf(now, norm(text)) === 1) return true;
-            var l2 = findEditor(); if (l2) l2.textContent = '';
-            await sleep(200);
+            if (isTarget(oldText, newText)) return true;
+            var now = curText();
+            if (now && countOf(norm(now), norm(newText)) === 1) return true;
+            try { var l2 = findEditor(); if (l2) l2.textContent = ''; } catch (e) {}
+            await sleep(250);
         }
-        return false;
+        return isTarget(oldText, newText);
     }
+    function trustedPaste() {
+        try {
+            var el = findEditor(); if (!el) return false;
+            el.focus();
+            document.execCommand('selectAll', false, null);
+            document.execCommand('paste');
+            return true;
+        } catch (e) { return false; }
+    }
+
+    /* ================= 发送 ================= */
     function findSendIcon() {
         return document.querySelector('span[data-icon="wds-ic-send-filled"]') || document.querySelector('span[data-icon="send"]');
     }
     function sendMessage() {
-        var icon = findSendIcon(); if (icon) { var b = icon.closest('button'); if (b) { b.click(); return true; } }
-        var aria = document.querySelector('button[aria-label="发送"], button[aria-label="Send"]'); if (aria) { aria.click(); return true; }
+        var icon = findSendIcon();
+        if (icon) { var b = icon.closest('button'); if (b) { b.click(); return true; } }
+        var aria = document.querySelector('button[aria-label="发送"], button[aria-label="Send"]');
+        if (aria) { aria.click(); return true; }
+        var ed = findEditor();
+        if (ed) {
+            ed.dispatchEvent(new KeyboardEvent('keydown', { key: 'Enter', code: 'Enter', keyCode: 13, which: 13, bubbles: true, cancelable: true }));
+            ed.dispatchEvent(new KeyboardEvent('keyup', { key: 'Enter', code: 'Enter', keyCode: 13, which: 13, bubbles: true, cancelable: true }));
+            return true;
+        }
         return false;
     }
 
-    /**************** UI 基础 ****************/
-    function toast(msg, color, ms) {
-        var old = document.getElementById('wt-toast'); if (old) old.remove();
-        var t = document.createElement('div'); t.id = 'wt-toast'; t.textContent = msg;
-        t.style.cssText = 'position:fixed;left:50%;top:18px;transform:translateX(-50%);z-index:2147483647;background:#111b27;color:' + (color || '#4ade80') + ';font:600 13px/1.5 -apple-system,sans-serif;padding:9px 18px;border-radius:10px;box-shadow:0 4px 16px rgba(0,0,0,.4);';
-        document.body.appendChild(t);
-        setTimeout(function () { t.remove(); }, ms || 2600);
+    /* ================= 按钮 ================= */
+    var btn = document.createElement('div');
+    btn.id = 'wa-tr-btn';
+    var dup = document.getElementById('wa-tr-btn'); if (dup) dup.remove();
+    btn.style.cssText = 'position:fixed;left:0;top:0;z-index:2147483647;background:#008069;color:#fff;font:700 14px -apple-system,sans-serif;padding:8px 14px;border-radius:10px;cursor:pointer;box-shadow:0 4px 14px rgba(0,0,0,.35);user-select:none;white-space:nowrap;text-align:center;min-width:74px;box-sizing:border-box;display:none;';
+    function setBtn(t, bg) { btn.textContent = t; btn.style.background = bg || '#008069'; }
+    function paintBtn() {
+        if (S.txMode !== 'auto') { setBtn('译→' + langShort(S.txMode), '#008069'); return; }
+        var c = S.chatLang[chatKey()];
+        setBtn('译→' + (c && c.lang ? langShort(c.lang) : 'AUTO'), c && c.lang ? '#008069' : '#64748b');
     }
-    var btnBase = 'border:0;cursor:pointer;font:600 12px -apple-system,sans-serif;padding:6px 12px;border-radius:8px;color:#fff;';
-    var SW_CSS = '.wt-sw{position:relative;display:inline-block;width:40px;height:22px;}' +
-        '.wt-sw input{display:none;}' +
-        '.wt-sw i{position:absolute;inset:0;background:#cbd5e1;border-radius:22px;transition:.2s;}' +
-        '.wt-sw i:before{content:"";position:absolute;width:18px;height:18px;left:2px;top:2px;background:#fff;border-radius:50%;transition:.2s;}' +
-        '.wt-sw input:checked + i{background:#00a884;}' +
-        '.wt-sw input:checked + i:before{transform:translateX(18px);}';
 
-    /**************** 接收消息翻译 ****************/
-    function markTranslatedEl(ct, box, text) {
-        box.className = 'wt-rx-box';
-        box.setAttribute('data-wt', '1');
-        box.style.cssText = 'margin:2px 0 2px 12px;padding:4px 10px;border-left:3px solid #00a884;color:#54656f;font:13px/1.55 -apple-system,sans-serif;white-space:pre-wrap;word-break:break-word;max-width:640px;';
-        box.innerHTML = '<span style="color:#00a884;font-weight:700;font-size:11px;margin-right:6px;">译</span>' + esc(text);
-        ct.setAttribute('data-wt-done', '1');
-        (ct.parentNode || ct.closest('.message-in')).appendChild(box);
-    }
-    function translateMessageIn(ct) {
-        if (ct.getAttribute('data-wt-done') === '1') return;
-        var sel = ct.querySelector('.selectable-text, span[data-qa="msg-text"], span');
-        var raw = (sel && (sel.innerText || sel.textContent) || '').trim();
-        if (!raw || raw.length > 3000) return;
-        ct.setAttribute('data-wt-done', '1');
-        var box = document.createElement('div');
-        markTranslatedEl(ct, box, '翻译中…');
-        translateSmart(raw, detectLangHeuristic(raw), settings.rxLang).then(function (r) {
-            markTranslatedEl(ct, box, r.text);
-            var ck = currentContactKey();
-            if (detectLangHeuristic(raw) !== settings.rxLang) {
-                settings.contactLang[ck] = detectLangHeuristic(raw); saveCfg();
-            }
-        }).catch(function () { markTranslatedEl(ct, box, '翻译失败'); });
-    }
-    function scanMessages(root) {
-        if (!settings.rxEnabled) return;
-        var nodes = (root || document).querySelectorAll('.message-in .copyable-text:not([data-wt-done])');
-        for (var i = 0; i < nodes.length; i++) {
-            if (i > 60) break;
-            translateMessageIn(nodes[i]);
-        }
-    }
-    var rxObserver = new MutationObserver(function (muts) {
-        for (var i = 0; i < muts.length; i++) {
-            var added = muts[i].addedNodes;
-            for (var j = 0; j < added.length; j++) {
-                var n = added[j];
-                if (n.nodeType !== 1) continue;
-                var list = n.matches && n.matches('.message-in .copyable-text') ? [n] : n.querySelectorAll('.message-in .copyable-text:not([data-wt-done])');
-                for (var k = 0; k < list.length && k < 30; k++) translateMessageIn(list[k]);
-            }
-        }
-    });
-    function startRx() {
-        var main = document.querySelector('#main');
-        if (!main) { setTimeout(startRx, 1500); return; }
-        rxObserver.observe(main, { childList: true, subtree: true });
-        setTimeout(function () { scanMessages(document); }, 2500);
-        setTimeout(function () { scanMessages(document); }, 8000);
-    }
-    startRx();
+    // 语言选择小按钮（贴在"译"左边）
+    var langBtn = document.createElement('div');
+    langBtn.id = 'wa-tr-lang';
+    langBtn.textContent = '语言▾';
+    langBtn.style.cssText = 'position:fixed;left:0;top:0;z-index:2147483647;background:#334155;color:#fff;font:600 12px -apple-system,sans-serif;padding:9px 10px;border-radius:10px;cursor:pointer;box-shadow:0 4px 14px rgba(0,0,0,.35);user-select:none;white-space:nowrap;display:none;';
 
-    /**************** 发送翻译条 ****************/
-    var txBar = document.createElement('div');
-    txBar.id = 'wt-tx-bar';
-    txBar.style.cssText = 'position:fixed;left:14px;bottom:64px;z-index:2147483647;width:340px;background:#fff;border-radius:12px;box-shadow:0 6px 24px rgba(0,0,0,.28);font:13px/1.5 -apple-system,sans-serif;display:none;flex-direction:column;overflow:hidden;';
-    txBar.innerHTML =
-        '<div style="display:flex;align-items:center;gap:8px;padding:8px 10px;background:#f0f2f5;border-bottom:1px solid #e2e8f0;">' +
-        '<b style="font-size:13px;color:#111b27;">发送翻译</b>' +
-        '<span id="wt-tx-lang" style="color:#008069;font-weight:700;"></span>' +
-        '<span style="flex:1;"></span>' +
-        '<button id="wt-tx-cfg" style="' + btnBase + 'background:#94a3b8;">设置</button>' +
-        '</div>' +
-        '<div style="padding:10px;">' +
-        '<textarea id="wt-tx-input" rows="2" placeholder="输入需要翻译的文字（中文或任意语言）" style="width:100%;box-sizing:border-box;border:1px solid #cbd5e1;border-radius:8px;padding:8px;font:13px/1.5 inherit;resize:none;outline:none;"></textarea>' +
-        '<div style="display:flex;gap:6px;margin-top:8px;align-items:center;">' +
-        '<span style="color:#64748b;font-size:11px;">Ctrl+Enter 翻译</span><span style="flex:1;"></span>' +
-        '<button id="wt-tx-go" style="' + btnBase + 'background:#008069;">翻译并预览</button>' +
-        '</div>' +
-        '<div id="wt-tx-out" style="display:none;margin-top:10px;padding:10px;background:#f0fdf4;border:1px solid #bbf7d0;border-radius:8px;">' +
-        '<div id="wt-tx-text" style="color:#111b27;white-space:pre-wrap;word-break:break-word;"></div>' +
-        '<div id="wt-tx-meta" style="color:#64748b;font-size:11px;margin-top:6px;"></div>' +
-        '<div style="display:flex;gap:6px;margin-top:8px;">' +
-        '<button id="wt-tx-fill" style="' + btnBase + 'background:#00a884;">填入输入框</button>' +
-        '<button id="wt-tx-fill2" style="' + btnBase + 'background:#0ea5e9;">原文+译文</button>' +
-        '<button id="wt-tx-copy" style="' + btnBase + 'background:#94a3b8;">复制译文</button>' +
-        '</div></div></div>';
-    document.body.appendChild(txBar);
-    var $ = function (id) { return document.getElementById(id); };
-    var lastTx = '';
-    function txLangLabel() { var c = currentTxLang(); $('wt-tx-lang').textContent = '→ ' + langName(c) + (settings.txLang === 'auto' ? ' (AUTO)' : ''); }
-    $('wt-tx-cfg').onclick = openSettings;
-    async function doTx() {
-        var text = ($('wt-tx-input').value || '').trim();
-        if (!text) return;
-        var tgt = currentTxLang();
-        $('wt-tx-go').textContent = '翻译中…'; $('wt-tx-go').disabled = true;
-        try {
-            var r = await translateSmart(text, 'auto', tgt);
-            lastTx = r.text;
-            $('wt-tx-text').textContent = r.text;
-            $('wt-tx-meta').textContent = '引擎:' + r.engine + ' · 目标语:' + langName(tgt) + ' · 请人工确认后发送';
-            $('wt-tx-out').style.display = 'block';
-        } catch (e) { toast('翻译失败:' + e, '#f87171'); }
-        $('wt-tx-go').textContent = '翻译并预览'; $('wt-tx-go').disabled = false;
-    }
-    $('wt-tx-go').onclick = doTx;
-    $('wt-tx-input').addEventListener('keydown', function (e) { if (e.key === 'Enter' && (e.ctrlKey || e.metaKey)) { e.preventDefault(); doTx(); } });
-    $('wt-tx-fill').onclick = function () { if (lastTx) { fillEditor(lastTx).then(function (ok) { toast(ok ? '已填入，请检查后点发送' : '填入失败，请手动粘贴', ok ? '#4ade80' : '#f87171'); }); } };
-    $('wt-tx-fill2').onclick = function () {
-        if (!lastTx) return;
-        var both = ($('wt-tx-input').value || '').trim() + '\n' + lastTx;
-        fillEditor(both).then(function (ok) { toast(ok ? '已填入(双语)，请检查后发送' : '填入失败', ok ? '#4ade80' : '#f87171'); });
-    };
-    $('wt-tx-copy').onclick = function () {
-        if (!lastTx) return;
-        try { GM_setClipboard(lastTx); toast('已复制译文'); } catch (e) { navigator.clipboard.writeText(lastTx); toast('已复制'); }
-    };
-    // 底部 AI / 译 悬浮钮
-    var dock = document.createElement('div');
-    dock.style.cssText = 'position:fixed;left:14px;bottom:20px;z-index:2147483647;display:flex;gap:8px;';
-    dock.innerHTML = '<button id="wt-btn-tx" style="' + btnBase + 'background:#008069;padding:8px 14px;">译✎</button>' +
-        '<button id="wt-btn-ai" style="' + btnBase + 'background:#7c3aed;padding:8px 14px;">AI 回复</button>' +
-        '<button id="wt-btn-quick" style="' + btnBase + 'background:#334155;padding:8px 14px;">快译</button>';
-    document.body.appendChild(dock);
-    $('wt-btn-tx').onclick = function () {
-        var show = txBar.style.display !== 'flex';
-        txBar.style.display = show ? 'flex' : 'none';
-        if (show) { txLangLabel(); $('wt-tx-input').focus(); }
-    };
-    $('wt-btn-quick').onclick = function () {
-        var ed = findEditor(); if (!ed) return toast('未找到输入框', '#f87171');
-        var t = (ed.innerText || '').trim(); if (!t) return toast('输入框为空', '#f59e0b');
-        toast('快译中…', '#60a5fa');
-        translateSmart(t, 'auto', currentTxLang()).then(function (r) {
-            fillEditor(r.text).then(function (ok) { toast(ok ? '已填入: ' + r.engine + '，确认后发送' : '填入失败，已复制译文', ok ? '#4ade80' : '#f59e0b'); });
-        }).catch(function (e) { toast('失败:' + e, '#f87171'); });
-    };
-    setInterval(txLangLabel, 3000);
+    var menu = document.createElement('div');
+    menu.id = 'wa-tr-menu';
+    menu.style.cssText = 'position:fixed;left:0;top:0;z-index:2147483647;background:#ffffff;color:#111b27;border-radius:12px;box-shadow:0 8px 30px rgba(0,0,0,.28);font:13px/1.4 -apple-system,sans-serif;width:250px;max-height:60vh;overflow:auto;display:none;padding:6px;';
 
-    /**************** AI 回复推荐 ****************/
-    var aiPanel = document.createElement('div');
-    aiPanel.id = 'wt-ai-panel';
-    aiPanel.style.cssText = 'position:fixed;right:14px;bottom:64px;width:360px;max-height:70vh;z-index:2147483647;background:#fff;border-radius:12px;box-shadow:0 6px 24px rgba(0,0,0,.28);font:13px/1.5 -apple-system,sans-serif;display:none;flex-direction:column;overflow:hidden;';
-    aiPanel.innerHTML =
-        '<div style="display:flex;align-items:center;padding:8px 10px;background:#f5f3ff;border-bottom:1px solid #e9d5ff;">' +
-        '<b style="color:#5b21b6;">AI 回复推荐</b><span id="wt-ai-ctx" style="margin-left:8px;color:#64748b;font-size:11px;"></span><span style="flex:1;"></span>' +
-        '<button id="wt-ai-close" style="' + btnBase + 'background:#94a3b8;">关闭</button></div>' +
-        '<div id="wt-ai-list" style="padding:10px;overflow:auto;"></div>' +
-        '<div style="padding:8px 10px;border-top:1px solid #e2e8f0;background:#fafafa;color:#64748b;font-size:11px;">生成后务必人工核对再发送 · 语种随对方语言</div>';
-    document.body.appendChild(aiPanel);
-    function gatherContext() {
-        var out = [];
-        var nodes = document.querySelectorAll('#main [data-id]');
-        for (var i = 0; i < nodes.length; i++) {
-            var el = nodes[i];
-            var ct = el.querySelector('.copyable-text') || el;
-            var sel = ct.querySelector('.selectable-text') || ct;
-            var txt = (sel.innerText || sel.textContent || '').trim();
-            if (!txt) continue;
-            var mine = !!el.closest('.message-out');
-            if (el.classList && el.classList.contains('message-in')) mine = false;
-            if (el.classList && el.classList.contains('message-out')) mine = true;
-            out.push((mine ? '我' : '对方') + ': ' + txt);
+    function buildMenu() {
+        var k = chatKey();
+        var cur = S.chatLang[k] || {};
+        var html = '<div style="padding:6px 8px;color:#64748b;font-size:11px;">目标语言（本次会话）</div>';
+        html += '<div class="it" data-v="auto" style="padding:8px;border-radius:8px;cursor:pointer;color:#111b27;' + ((!cur.manual && S.txMode === 'auto') ? 'background:#ecfdf5;font-weight:700;' : '') + '">自动跟客户 ' + (!cur.manual && cur.lang ? '（当前 ' + langShort(cur.lang) + '）' : '') + '</div>';
+        html += '<div class="it" data-v="redetect" style="padding:8px;border-radius:8px;cursor:pointer;color:#0369a1;">🔄 重新识别本会话语言</div>';
+        for (var i = 0; i < LANGS.length; i++) {
+            var L = LANGS[i], on = cur.manual && cur.lang === L[0];
+            html += '<div class="it" data-v="' + L[0] + '" style="padding:7px 8px;border-radius:8px;cursor:pointer;color:#111b27;' + (on ? 'background:#ecfdf5;font-weight:700;' : '') + '">' + L[1] + '</div>';
         }
-        return out.slice(-(settings.aiContextN || 30)).join('\n');
-    }
-    async function aiGenerate() {
-        if (!settings.llmKey) { openSettings(); return toast('请先在设置里填 LLM API Key', '#f59e0b'); }
-        var ctx = gatherContext();
-        $('wt-ai-ctx').textContent = '上下文 ' + String(ctx.split('\n').length) + ' 条';
-        $('wt-ai-list').innerHTML = '<div style="color:#64748b;">生成中…</div>';
-        var tgt = currentTxLang();
-        var sys = '你是外贸业务助理，帮老板回复WhatsApp客户。' + settings.aiPersona +
-            '\n客户语种：' + langName(tgt) + '。基于下面的聊天记录，给出恰好 ' + settings.aiCount + ' 条可以直接发送的回复建议，覆盖不同角度(确认信息/推进报价/催回复)。' +
-            '\n输出格式：每条一行，行与行之间用单独一行 ' + '---' + ' 分隔；不要编号；只写客户语种的正文，不要中文，不要解释。';
-        try {
-            var r = await gmPostJson((settings.llmBase || 'https://api.openai.com/v1').replace(/\/+$/, '') + '/chat/completions', {
-                model: settings.llmModel || 'gpt-4o-mini', temperature: 0.7,
-                messages: [{ role: 'system', content: sys }, { role: 'user', content: ctx || '(无上下文)' }]
-            }, { 'Authorization': 'Bearer ' + settings.llmKey });
-            var j = JSON.parse(r); var content = j.choices[0].message.content.trim();
-            var items = content.split(/\n-{3,}\n|\n---\n/).map(function (s) { return s.trim(); }).filter(Boolean);
-            renderAi(items);
-        } catch (e) { $('wt-ai-list').innerHTML = '<div style="color:#f87171;">生成失败:' + esc(e.message || e) + '</div>'; }
-    }
-    function renderAi(items) {
-        var box = $('wt-ai-list'); box.innerHTML = '';
-        if (!items.length) { box.innerHTML = '<div style="color:#f87171;">未生成候选</div>'; return; }
-        items.forEach(function (t) {
-            var d = document.createElement('div');
-            d.style.cssText = 'padding:10px;border:1px solid #e2e8f0;border-radius:8px;margin-bottom:8px;';
-            d.innerHTML = '<div style="white-space:pre-wrap;word-break:break-word;">' + esc(t) + '</div>' +
-                '<div style="display:flex;gap:6px;margin-top:8px;">' +
-                '<button class="wt-ai-fill" style="' + btnBase + 'background:#7c3aed;">填入输入框</button>' +
-                '<button class="wt-ai-cn" style="' + btnBase + 'background:#94a3b8;">看中文</button>' +
-                '<button class="wt-ai-copy" style="' + btnBase + 'background:#cbd5e1;color:#111b27;">复制</button></div>';
-            d.querySelector('.wt-ai-fill').onclick = function () { fillEditor(t).then(function (ok) { toast(ok ? '已填入，确认后发送' : '填入失败', ok ? '#4ade80' : '#f87171'); }); };
-            d.querySelector('.wt-ai-cn').onclick = function (e) {
-                e.target.textContent = '翻译中…';
-                translateSmart(t, 'auto', 'zh-CN').then(function (r) { e.target.textContent = r.text; }).catch(function () { e.target.textContent = '失败'; });
+        html += '<div class="it" data-v="settings" style="padding:8px;border-radius:8px;cursor:pointer;border-top:1px solid #e2e8f0;margin-top:4px;color:#0369a1;">⚙ 翻译设置…</div>';
+        menu.innerHTML = html;
+        Array.prototype.forEach.call(menu.querySelectorAll('.it'), function (el) {
+            el.onmouseenter = function () { if (!el.style.background) el.style.background = '#f1f5f9'; };
+            el.onmouseleave = function () { if (el.style.background === '#f1f5f9' || el.style.background === 'rgb(241, 245, 249)') el.style.background = ''; };
+            el.onclick = function () {
+                var v = el.getAttribute('data-v');
+                menu.style.display = 'none';
+                if (v === 'settings') { openSettings(); return; }
+                if (v === 'redetect') {
+                    delete S.chatLang[k]; saveCfg();
+                    lastSig = '';
+                    var lg = detectLang(incomingTexts(12));
+                    if (lg) { S.chatLang[k] = { lang: lg, manual: false }; saveCfg(); paintBtn(); flash('识别为 ' + langShort(lg)); }
+                    else { paintBtn(); flash('识别不出，请手动选'); }
+                    return;
+                }
+                if (v === 'auto') {
+                    delete S.chatLang[k];
+                    S.txMode = 'auto';
+                    lastSig = '';
+                    saveCfg(); paintBtn();
+                    setTimeout(function () { refreshChatLang(); paintBtn(); }, 300);
+                    flash('已改为自动识别'); return;
+                }
+                S.chatLang[k] = { lang: v, manual: true };
+                S.txMode = 'auto';          // 手动只影响本会话
+                saveCfg(); paintBtn();
+                flash('本会话译为 ' + langShort(v));
             };
-            d.querySelector('.wt-ai-copy').onclick = function () { try { GM_setClipboard(t); toast('已复制'); } catch (e) { navigator.clipboard.writeText(t); } };
-            box.appendChild(d);
         });
     }
-    $('wt-btn-ai').onclick = function () {
-        var show = aiPanel.style.display !== 'flex';
-        aiPanel.style.display = show ? 'flex' : 'none';
-        if (show) aiGenerate();
-    };
-    $('wt-ai-close').onclick = function () { aiPanel.style.display = 'none'; };
 
-    /**************** 设置弹窗(对标 TradeMessenger 翻译设置) ****************/
+    function flash(msg) {
+        setBtn(msg, '#f59e0b');
+        setTimeout(paintBtn, 1500);
+    }
+
+    /* ================= 主按钮：翻译 ================= */
+    btn.onclick = function () {
+        var ed = findEditor();
+        if (!ed) { setBtn('无输入框', '#ef4444'); setTimeout(paintBtn, 1600); return; }
+        var t = (ed.innerText || ed.textContent || '').trim();
+        if (!t) { setBtn('输入框为空', '#f59e0b'); setTimeout(paintBtn, 1600); return; }
+        if (t === lastTranslated) return;
+
+        var ck = chatKey();
+        var known = S.chatLang[ck] && S.chatLang[ck].lang;
+        if (S.txMode === 'auto' && !known) {
+            // 没识别出客户语言，绝不默认翻成英语——先让老板选一次
+            buildMenu();
+            menu.style.display = 'block';
+            setBtn('先选客户语言', '#f59e0b');
+            setTimeout(paintBtn, 2500);
+            return;
+        }
+
+        var tl = targetLang();
+        if (!tl || tl === 'zh-CN') { setBtn('目标是中文', '#ef4444'); setTimeout(paintBtn, 1600); return; }
+
+        state = STATE_IDLE;
+        setBtn('译 ' + langShort(tl) + '…', '#3b82f6');
+
+        translateSmart(t, tl).then(function (res) {
+            console.log('[WA翻译助手]', t, '→', tl, ':', res);
+            return replaceEditorText(ed, res, t).then(function (ok) {
+                if (!ok) {
+                    var copied = false;
+                    try { copied = GM_setClipboard(res); } catch (e) {}
+                    if (!copied) { try { navigator.clipboard.writeText(res); copied = true; } catch (e) {} }
+                    if (copied) {
+                        var hasOne = (function () { var c = curText(); return !!(c && countOf(norm(c), norm(res)) >= 1); })();
+                        if (!hasOne) trustedPaste();
+                    }
+                    setTimeout(function () {
+                        if (isTarget(t, res)) { lastTranslated = res; state = STATE_READY; paintBtn(); }
+                    }, 600);
+                    setBtn(copied ? '已复制·请粘贴' : '替换失败', copied ? '#f59e0b' : '#ef4444');
+                    setTimeout(paintBtn, 4000);
+                    return;
+                }
+                lastTranslated = res;
+                state = STATE_READY;
+                paintBtn();
+            });
+        }).catch(function (err) {
+            console.error('[WA翻译助手] 翻译失败:', err);
+            setBtn('翻译失败', '#ef4444');
+            setTimeout(paintBtn, 3000);
+        });
+    };
+
+    langBtn.onclick = function (e) {
+        e.stopPropagation();
+        if (menu.style.display === 'block') { menu.style.display = 'none'; return; }
+        buildMenu();
+        menu.style.display = 'block';
+        var r = btn.getBoundingClientRect();
+        var mw = menu.offsetWidth || 250, mh = menu.offsetHeight || 400;
+        menu.style.right = 'auto';
+        menu.style.bottom = 'auto';
+        menu.style.left = Math.max(8, Math.min(r.left, window.innerWidth - mw - 8)) + 'px';
+        menu.style.top = Math.max(8, r.top - mh - 10) + 'px';
+    };
+    document.addEventListener('mousedown', function (e) {
+        if (menu.style.display === 'block' && !menu.contains(e.target) && e.target !== langBtn) menu.style.display = 'none';
+    });
+
+    document.body.appendChild(langBtn);
+    document.body.appendChild(btn);
+    document.body.appendChild(menu);
+    paintBtn();
+
+    /* ================= 跟随输入框定位（面板开关/窗口缩放自适应） ================= */
+    function anchorRect() {
+        // 返回 {x: 按钮右侧贴靠的横坐标, mid: 垂直中线}
+        var send = findSendIcon();
+        var b = send && send.closest('button');
+        if (b) {
+            var r = b.getBoundingClientRect();
+            if (r.width && r.height) return { x: r.left, mid: r.top + r.height / 2 };
+        }
+        var ed = findEditor();
+        if (ed) {
+            var r2 = ed.getBoundingClientRect();
+            if (r2.width) return { x: r2.right - 56, mid: r2.top + r2.height / 2 };   // 给发送键留位
+        }
+        var f = document.querySelector('#main footer');
+        if (f) {
+            var r3 = f.getBoundingClientRect();
+            if (r3.width) return { x: r3.right - 56, mid: r3.top + r3.height / 2 };
+        }
+        return null;
+    }
+    function placeBar() {
+        var a = anchorRect();
+        if (!a) { btn.style.display = 'none'; langBtn.style.display = 'none'; return; }
+        btn.style.display = 'block';
+        langBtn.style.display = 'block';
+        var gap = 8;
+        var w1 = btn.offsetWidth || 74, h1 = btn.offsetHeight || 34;
+        var w2 = langBtn.offsetWidth || 62, h2 = langBtn.offsetHeight || 34;
+        var l1 = Math.max(6, a.x - gap - w1);
+        var l2 = Math.max(6, l1 - gap - w2);
+        btn.style.left = l1 + 'px';
+        btn.style.top = Math.round(a.mid - h1 / 2) + 'px';
+        langBtn.style.left = l2 + 'px';
+        langBtn.style.top = Math.round(a.mid - h2 / 2) + 'px';
+    }
+    var _ro = null;
+    function watchComposer() {
+        placeBar();
+        try {
+            if (!_ro && window.ResizeObserver) {
+                _ro = new ResizeObserver(function () { placeBar(); });
+                var m = document.querySelector('#main');
+                if (m) _ro.observe(m);
+            }
+        } catch (e) {}
+    }
+    watchComposer();
+    setInterval(watchComposer, 800);
+    window.addEventListener('resize', placeBar);
+
+    /* ================= 回车发送（译完才生效，沿用 v3.16） ================= */
+    document.addEventListener('keydown', function (e) {
+        if (!S.sendAfter) return;
+        if (state === STATE_READY && e.key === 'Enter' && !e.shiftKey) {
+            var ed = findEditor();
+            if (ed && (ed === document.activeElement || ed.contains(document.activeElement))) {
+                e.preventDefault();
+                e.stopPropagation();
+                if (sendMessage()) {
+                    state = STATE_IDLE;
+                    paintBtn();
+                }
+            }
+        }
+    }, true);
+
+    setInterval(function () {
+        if (state !== STATE_READY) return;
+        var ed = findEditor(); if (!ed) return;
+        if ((ed.innerText || '').trim() !== lastTranslated.trim()) { state = STATE_IDLE; paintBtn(); }
+    }, 500);
+
+    /* ================= 会话语种自动识别 ================= */
+    setInterval(refreshChatLang, 2000);
+    setTimeout(refreshChatLang, 2500);
+
+    /* ================= 设置面板 ================= */
     function openSettings() {
-        var old = document.getElementById('wt-settings'); if (old) old.remove();
+        var old = document.getElementById('wa-tr-cfg'); if (old) old.remove();
         var m = document.createElement('div');
-        m.id = 'wt-settings';
+        m.id = 'wa-tr-cfg';
         m.style.cssText = 'position:fixed;inset:0;z-index:2147483647;background:rgba(15,23,42,.45);display:flex;align-items:center;justify-content:center;';
+        var optDef = LANGS.map(function (L) {
+            return '<option value="' + L[0] + '"' + (L[0] === S.defaultLang ? ' selected' : '') + '>' + L[1] + '</option>';
+        }).join('');
         m.innerHTML =
-            '<style>' + SW_CSS + '</style>' +
-            '<div style="background:#fff;width:520px;max-width:94vw;max-height:88vh;overflow:auto;border-radius:14px;font:13px/1.6 -apple-system,sans-serif;box-shadow:0 20px 60px rgba(0,0,0,.35);">' +
-            '<div style="display:flex;align-items:center;padding:12px 16px;border-bottom:1px solid #e2e8f0;"><b style="font-size:15px;color:#111b27;">翻译设置</b><span style="flex:1;"></span><button id="wt-s-x" style="' + btnBase + 'background:#94a3b8;">关闭</button></div>' +
-            '<div style="padding:16px;display:flex;flex-direction:column;gap:16px;">' +
-            sec('接收消息翻译', '<label class="wt-sw"><input type="checkbox" id="c-rx" ' + (settings.rxEnabled ? 'checked' : '') + '><i></i></label> <span style="color:#64748b;">开启接收翻译</span><br>' +
-                '<span style="color:#64748b;">翻译为</span> <select id="c-rxl">' + langOpts(settings.rxLang) + '</select> <span style="color:#94a3b8;font-size:11px;">开启后，收到的消息自动译为中文/目标语言</span>') +
-            sec('发送消息实时翻译', '<label class="wt-sw"><input type="checkbox" id="c-tx" ' + (settings.txEnabled ? 'checked' : '') + '><i></i></label> <span style="color:#64748b;">开启发送翻译</span><br>' +
-                '<span style="color:#64748b;">翻译为</span> <select id="c-txl">' + '<option value="auto"' + (settings.txLang === 'auto' ? ' selected' : '') + '>自动检测 (AUTO)</option>' + langOpts(settings.txLang === 'auto' ? '' : settings.txLang) + '</select>' +
-                '<div style="margin-top:6px;color:#94a3b8;font-size:11px;">AUTO = 按当前联系人的消息语种自动选择；未识别时用默认语言 ' +
-                '<select id="c-txd">' + langOpts(settings.txDefaultLang) + '</select></div>') +
-            sec('翻译引擎', '<select id="c-eng" style="margin-bottom:8px;">' +
-                '<option value="llm"' + (settings.engine === 'llm' ? ' selected' : '') + '>LLM 翻译(带术语,质量最佳)</option>' +
-                '<option value="deepl"' + (settings.engine === 'deepl' ? ' selected' : '') + '>DeepL</option>' +
-                '<option value="free"' + (settings.engine === 'free' ? ' selected' : '') + '>免费端点</option>' +
-                '<option value="auto"' + (settings.engine === 'auto' ? ' selected' : '') + '>自动链(LLM→DeepL→免费)</option></select><br>' +
-                '<span style="color:#64748b;">LLM (OpenAI 兼容: GLM/DeepSeek/Qwen/Moonshot/OpenAI…)</span><br>' +
-                '<input id="c-base" value="' + esc(settings.llmBase) + '" placeholder="Base URL https://api.openai.com/v1" style="' + inp() + 'margin-bottom:6px;">' +
-                '<input id="c-key" value="' + esc(settings.llmKey) + '" placeholder="API Key (仅存本机 Tampermonkey 存储)" style="' + inp() + 'margin-bottom:6px;">' +
-                '<input id="c-model" value="' + esc(settings.llmModel) + '" placeholder="Model 如 gpt-4o-mini / glm-4-flash / deepseek-chat" style="' + inp() + 'margin-bottom:6px;">' +
-                '<span style="color:#64748b;">DeepL Key(可选)</span> <input id="c-deepl" value="' + esc(settings.deeplKey) + '" style="' + inp() + 'width:200px;"><br>' +
-                '<label style="color:#64748b;font-size:12px;"><input type="checkbox" id="c-fb" ' + (settings.freeFallback ? 'checked' : '') + '> 付费引擎失败时用免费端点兜底</label>') +
-            sec('术语库(每行一条, 源文|译文；规格/型号保持原样不写)', '<textarea id="c-gloss" rows="4" style="' + inp() + 'height:90px;resize:vertical;">' + esc(settings.glossary) + '</textarea>') +
-            sec('AI 回复推荐', '<span style="color:#64748b;">业务人设(影响推荐语气与策略)</span><textarea id="c-persona" rows="2" style="' + inp() + 'height:50px;resize:vertical;">' + esc(settings.aiPersona) + '</textarea>' +
-                '<div style="margin-top:6px;">候选条数 <input id="c-cnt" type="number" min="1" max="5" value="' + settings.aiCount + '" style="width:52px;' + inp() + '"> · 上下文条数 <input id="c-ctxn" type="number" min="5" max="80" value="' + settings.aiContextN + '" style="width:52px;' + inp() + '"></div>') +
-            '</div>' +
-            '<div style="display:flex;gap:8px;padding:12px 16px;border-top:1px solid #e2e8f0;background:#fafafa;">' +
-            '<button id="wt-s-test" style="' + btnBase + 'background:#0ea5e9;">测试翻译</button>' +
-            '<button id="wt-s-tm" style="' + btnBase + 'background:#94a3b8;">清空翻译记忆</button><span style="flex:1;"></span>' +
-            '<button id="wt-s-save" style="' + btnBase + 'background:#008069;">保存</button></div></div>';
+            '<div style="background:#fff;color:#111b27;width:460px;max-width:94vw;border-radius:14px;font:13px/1.6 -apple-system,sans-serif;box-shadow:0 20px 60px rgba(0,0,0,.35);overflow:hidden;">' +
+            '<div style="display:flex;align-items:center;padding:12px 16px;border-bottom:1px solid #e2e8f0;"><b style="font-size:15px;">翻译设置</b><span style="flex:1;"></span><span id="x" style="cursor:pointer;color:#94a3b8;font-weight:700;">✕</span></div>' +
+            '<div style="padding:16px;display:flex;flex-direction:column;gap:14px;">' +
+            '<div><b>识别不出客户语言时，默认译为</b><br><select id="c-def" style="width:100%;padding:7px;border:1px solid #cbd5e1;border-radius:8px;color:#111b27;background:#fff;margin-top:6px;">' + optDef + '</select></div>' +
+            '<div><label style="cursor:pointer;"><input type="checkbox" id="c-send" ' + (S.sendAfter ? 'checked' : '') + '> 译完直接回车发送（取消则只替换不发送）</label></div>' +
+            '<div style="border-top:1px dashed #e2e8f0;padding-top:12px;">' +
+            '<label style="cursor:pointer;"><input type="checkbox" id="c-ai" ' + (S.aiOn ? 'checked' : '') + '> <b>用 AI 翻译</b>（术语更准，需填 Key；不勾则用免费机翻）</label>' +
+            '<input id="c-base" value="' + S.aiBase + '" placeholder="Base URL" style="width:100%;box-sizing:border-box;padding:7px;border:1px solid #cbd5e1;border-radius:8px;color:#111b27;background:#fff;margin-top:8px;">' +
+            '<input id="c-key" value="' + S.aiKey + '" placeholder="API Key（仅存本机）" style="width:100%;box-sizing:border-box;padding:7px;border:1px solid #cbd5e1;border-radius:8px;color:#111b27;background:#fff;margin-top:6px;">' +
+            '<input id="c-model" value="' + S.aiModel + '" placeholder="模型，如 deepseek-chat / glm-4-flash" style="width:100%;box-sizing:border-box;padding:7px;border:1px solid #cbd5e1;border-radius:8px;color:#111b27;background:#fff;margin-top:6px;">' +
+            '</div></div>' +
+            '<div style="display:flex;gap:8px;padding:12px 16px;border-top:1px solid #e2e8f0;background:#fafafa;"><span style="flex:1;"></span>' +
+            '<button id="sv" style="background:#008069;color:#fff;border:0;border-radius:8px;padding:8px 18px;font:600 13px inherit;cursor:pointer;">保存</button></div></div>';
         document.body.appendChild(m);
-        function inp() { return 'box-sizing:border-box;border:1px solid #cbd5e1;border-radius:8px;padding:8px;font:13px/1.5 inherit;width:100%;outline:none;'; }
-        function sec(title, body) { return '<div style="border:1px solid #e2e8f0;border-radius:10px;padding:12px;background:#fcfdff;"><b style="color:#111b27;">' + title + '</b><div style="margin-top:8px;">' + body + '</div></div>'; }
-        function langOpts(sel) { return LANGS.map(function (l) { return '<option value="' + l[0] + '"' + (l[0] === sel ? ' selected' : '') + '>' + l[1] + '</option>'; }).join(''); }
-        m.querySelector('#wt-s-x').onclick = function () { m.remove(); };
+        m.querySelector('#x').onclick = function () { m.remove(); };
         m.addEventListener('click', function (e) { if (e.target === m) m.remove(); });
-        m.querySelector('#wt-s-save').onclick = function () {
-            settings.rxEnabled = m.querySelector('#c-rx').checked;
-            settings.rxLang = m.querySelector('#c-rxl').value;
-            settings.txEnabled = m.querySelector('#c-tx').checked;
-            settings.txLang = m.querySelector('#c-txl').value;
-            settings.txDefaultLang = m.querySelector('#c-txd').value;
-            settings.engine = m.querySelector('#c-eng').value;
-            settings.llmBase = m.querySelector('#c-base').value.trim();
-            settings.llmKey = m.querySelector('#c-key').value.trim();
-            settings.llmModel = m.querySelector('#c-model').value.trim();
-            settings.deeplKey = m.querySelector('#c-deepl').value.trim();
-            settings.freeFallback = m.querySelector('#c-fb').checked;
-            settings.glossary = m.querySelector('#c-gloss').value;
-            settings.aiPersona = m.querySelector('#c-persona').value;
-            settings.aiCount = Math.max(1, Math.min(5, +m.querySelector('#c-cnt').value || 3));
-            settings.aiContextN = Math.max(5, Math.min(80, +m.querySelector('#c-ctxn').value || 30));
-            saveCfg();
-            toast('已保存', '#4ade80'); txLangLabel();
-            setTimeout(function () { scanMessages(document); }, 300);
-            m.remove();
-        };
-        m.querySelector('#wt-s-test').onclick = function () {
-            var sample = 'We can offer SS304 M8 hex bolts at USD 0.005/pc, MOQ 1000 pieces, FOB Ningbo.';
-            var tgt = m.querySelector('#c-rxl').value;
-            var b = m.querySelector('#c-base').value.trim(), k = m.querySelector('#c-key').value.trim(), mo = m.querySelector('#c-model').value.trim();
-            var bak = [settings.llmBase, settings.llmKey, settings.llmModel, settings.glossary];
-            settings.llmBase = b; settings.llmKey = k; settings.llmModel = mo; settings.glossary = m.querySelector('#c-gloss').value;
-            toast('测试翻译中…', '#60a5fa', 5000);
-            translateSmart(sample, 'en', tgt).then(function (r) {
-                alert('译文(' + r.engine + '):\n' + r.text);
-                settings.llmBase = bak[0]; settings.llmKey = bak[1]; settings.llmModel = bak[2]; settings.glossary = bak[3];
-            }).catch(function (e) { alert('测试失败:' + e); });
-        };
-        m.querySelector('#wt-s-tm').onclick = function () {
-            if (confirm('清空全部翻译记忆？下次相同文本会重新请求引擎')) { tmCache = {}; GM_deleteValue('tm'); toast('已清空', '#4ade80'); }
+        m.querySelector('#sv').onclick = function () {
+            S.defaultLang = m.querySelector('#c-def').value;
+            S.sendAfter = m.querySelector('#c-send').checked;
+            S.aiOn = m.querySelector('#c-ai').checked;
+            S.aiBase = m.querySelector('#c-base').value.trim() || 'https://api.deepseek.com/v1';
+            S.aiKey = m.querySelector('#c-key').value.trim();
+            S.aiModel = m.querySelector('#c-model').value.trim() || 'deepseek-chat';
+            saveCfg(); paintBtn(); m.remove();
+            flash('已保存');
         };
     }
-    GM_registerMenuCommand('WhatsApp 智译助手 · 设置', openSettings);
-    if (!settings.llmKey) setTimeout(function () { toast('首次使用：请点左下角「AI 回复」或菜单填 LLM Key 后生效', '#f59e0b', 5000); }, 4000);
+    GM_registerMenuCommand('翻译设置', openSettings);
 
-    // 划词翻译气泡(保留旧功能)
+    /* ================= 划词翻译 ================= */
     var bubble = document.createElement('div');
     bubble.style.cssText = 'position:fixed;z-index:2147483647;max-width:340px;padding:8px 12px;background:#111b27;color:#e6edf3;font:13px/1.6 -apple-system,sans-serif;border-radius:8px;box-shadow:0 4px 16px rgba(0,0,0,.4);display:none;white-space:pre-wrap;';
     document.body.appendChild(bubble);
     document.addEventListener('mousedown', function (e) { if (!bubble.contains(e.target)) bubble.style.display = 'none'; });
     document.addEventListener('mouseup', function (e) {
+        if (menu.style.display === 'block') return;
         var text = (window.getSelection() + '').trim();
         if (!text || text.length > 500) return;
-        translateSmart(text, 'auto', settings.rxLang).then(function (r) {
-            bubble.textContent = r.text;
+        mtTranslate(text, 'auto', 'zh-CN').then(function (res) {
+            bubble.textContent = res;
             bubble.style.left = Math.min(e.clientX + 12, innerWidth - 360) + 'px';
             bubble.style.top = Math.min(e.clientY + 12, innerHeight - 100) + 'px';
             bubble.style.display = 'block';
-        }).catch(function (err) { bubble.textContent = '翻译失败:' + err; bubble.style.display = 'block'; });
+        }).catch(function (err) {
+            bubble.textContent = '翻译失败:' + err;
+            bubble.style.display = 'block';
+        });
     });
 
-    setTimeout(function () { toast('WhatsApp 智译助手已加载 ✓', '#4ade80'); }, 800);
+    /* ================= 加载提示 ================= */
+    var toast = document.createElement('div');
+    toast.textContent = 'WA翻译助手 v4.0.5 已加载 ✓ 点多语言切换 → 自动跟客户';
+    toast.style.cssText = 'position:fixed;left:16px;bottom:16px;z-index:2147483647;background:#111b27;color:#4ade80;font:600 12px/1.6 -apple-system,sans-serif;padding:8px 14px;border-radius:8px;box-shadow:0 4px 12px rgba(0,0,0,.35);';
+    document.body.appendChild(toast);
+    setTimeout(function () { toast.style.display = 'none'; }, 4000);
 })();
