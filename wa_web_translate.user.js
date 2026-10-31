@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         WhatsApp Web 翻译助手
 // @namespace    wa-translate
-// @version      4.0.5
+// @version      4.1.2
 // @description  中文→多国语言：按客户自动识别语种，输入框一键翻译+发送；划词翻译。零依赖，不装服务。
 // @match        https://web.whatsapp.com/*
 // @grant        GM_xmlhttpRequest
@@ -22,7 +22,7 @@
 (function () {
     'use strict';
 
-    console.log('[WA翻译助手] v4.0.5 启动');
+    console.log('[WA翻译助手] v4.1.2 启动');
 
     var STATE_IDLE = 0, STATE_READY = 1;
     var state = STATE_IDLE;
@@ -182,7 +182,7 @@
         vi: 'va cua la cho khong co gia cam on bao nhieu can',
         ro: 'si in de la cu nu este pentru pret multumesc va rog',
         sv: 'och att det som ar for med inte jag pris tack behover',
-        ca: 'el la els les de que i en un una per amb del al es no si com gratis preu'
+        ca: 'els amb gratis preu aquest aquesta molt tambe gracies vull'
     };
     function deaccent(s) {
         try {
@@ -199,7 +199,7 @@
         if (/[\u4e00-\u9fff]/.test(blob)) return 'zh-CN';
         if (/[\u3040-\u30ff]/.test(blob)) return 'ja';
         if (/[\uac00-\ud7af]/.test(blob)) return 'ko';
-        if (/[\u0600-\u06ff]/.test(blob)) return /[\u06a9]/.test(blob) ? 'fa' : 'ar';
+        if (/[\u0600-\u06ff]/.test(blob)) return /[\u06a9\u06cc\u067e\u0686\u0698\u06af]/.test(blob) ? 'fa' : 'ar';
         if (/[\u0590-\u05ff]/.test(blob)) return 'he';
         if (/[\u0e00-\u0e7f]/.test(blob)) return 'th';
         if (/[\u0900-\u097f]/.test(blob)) return 'hi';
@@ -211,14 +211,27 @@
         }
         var words = wordTokens(blob);
         if (!words.length) return null;
+        // 统计每个词出现在几个语种表里：只有"独占词"才算有效证据，避免 de/do/la 这类多语共用词带偏
+        var pools = {};
+        for (var code in STOP) pools[code] = STOP[code].split(' ');
+        var seen = {};
+        for (var code2 in pools) {
+            for (var wi = 0; wi < pools[code2].length; wi++) {
+                var w = pools[code2][wi];
+                if (!seen[w]) seen[w] = [];
+                if (seen[w].indexOf(code2) < 0) seen[w].push(code2);
+            }
+        }
         var best = null, bestHit = 0;
-        for (var code in STOP) {
-            var pool = STOP[code].split(' '), hit = 0;
-            for (var i = 0; i < words.length; i++) if (pool.indexOf(words[i]) > -1) hit++;
-            if (hit > bestHit) { best = code; bestHit = hit; }
+        for (var code3 in pools) {
+            var hit = 0;
+            for (var i = 0; i < words.length; i++) {
+                var owners = seen[words[i]];
+                if (owners && owners.length === 1 && owners[0] === code3) hit++;
+            }
+            if (hit > bestHit) { best = code3; bestHit = hit; }
         }
         if (!best || bestHit === 0) return null;      // 认不出就别乱设
-        if (bestHit < 2 && blob.length < 40) return null;   // 证据太弱，保持原判断
         return best;
     }
 
@@ -236,20 +249,33 @@
     function inComposer(el) {
         try { return !!(el.closest && el.closest('footer')); } catch (e) { return false; }
     }
+    // 兜底判断「这是我发的」：气泡靠右 = 我方；靠左 = 客户
+    function isOutgoing(el) {
+        try {
+            var row = el.closest('[data-id]') || el.closest('div[role="row"]') || el;
+            var main = document.querySelector('#main');
+            if (!row || !main || !row.getBoundingClientRect) return false;
+            var r = row.getBoundingClientRect(), m = main.getBoundingClientRect();
+            if (!r.width || !m.width) return false;
+            return (r.left + r.width / 2) > (m.left + m.width / 2);
+        } catch (e) { return false; }
+    }
     function msgSource() {
         var a = document.querySelectorAll('#main [data-id^="false_"]');
         if (a.length) return a;
         a = document.querySelectorAll('#main .message-in');
         if (a.length) return a;
         var raw = document.querySelectorAll('#main .selectable-text');
-        if (raw.length) {
-            var out = [];
-            for (var i = 0; i < raw.length; i++) if (!inComposer(raw[i])) out.push(raw[i]);
-            if (out.length) return out;
+        var out = [];
+        for (var i = 0; i < raw.length; i++) {
+            if (!inComposer(raw[i]) && !isOutgoing(raw[i])) out.push(raw[i]);
         }
-        var rows = document.querySelectorAll('#main div[role="row"]'), out2 = [];
-        for (var j = 0; j < rows.length; j++) if (!inComposer(rows[j])) out2.push(rows[j]);
-        return out2;
+        if (out.length) return out;
+        var rows = document.querySelectorAll('#main div[role="row"]');
+        for (var j = 0; j < rows.length; j++) {
+            if (!inComposer(rows[j]) && !isOutgoing(rows[j])) out.push(rows[j]);
+        }
+        return out;
     }
     function stripNoise(s) {
         return (s || '')
@@ -393,19 +419,45 @@
     var btn = document.createElement('div');
     btn.id = 'wa-tr-btn';
     var dup = document.getElementById('wa-tr-btn'); if (dup) dup.remove();
-    btn.style.cssText = 'position:fixed;left:0;top:0;z-index:2147483647;background:#008069;color:#fff;font:700 14px -apple-system,sans-serif;padding:8px 14px;border-radius:10px;cursor:pointer;box-shadow:0 4px 14px rgba(0,0,0,.35);user-select:none;white-space:nowrap;text-align:center;min-width:74px;box-sizing:border-box;display:none;';
-    function setBtn(t, bg) { btn.textContent = t; btn.style.background = bg || '#008069'; }
+    btn.style.cssText = 'position:fixed;left:0;top:0;z-index:2147483647;background:#008069;color:#fff;font:700 15px -apple-system,sans-serif;width:42px;height:42px;border-radius:50%;cursor:pointer;box-shadow:0 4px 14px rgba(0,0,0,.35);user-select:none;text-align:center;box-sizing:border-box;display:none;padding:0;overflow:hidden;flex-direction:column;align-items:center;justify-content:center;';
+    function setBtn(t, bg) {                  // 闪提示用（长文案，自动缩小）
+        btn.innerHTML = '<b style="font:700 10px/1.15 -apple-system,sans-serif;font-weight:700;"></b>';
+        btn.firstChild.textContent = t;
+        btn.style.background = bg || '#008069';
+    }
+    function setBtnLang(code, bg) {           // 正常两行：译 / 语种
+        btn.innerHTML = '<b style="font:700 15px/1 -apple-system,sans-serif;">译</b>' +
+            '<i style="font:700 9px/1.3 -apple-system,sans-serif;font-style:normal;opacity:.92;letter-spacing:.3px;"></i>';
+        btn.lastChild.textContent = code || '';
+        btn.style.background = bg || '#008069';
+    }
     function paintBtn() {
-        if (S.txMode !== 'auto') { setBtn('译→' + langShort(S.txMode), '#008069'); return; }
+        if (S.txMode !== 'auto') { setBtnLang(langShort(S.txMode), '#008069'); return; }
         var c = S.chatLang[chatKey()];
-        setBtn('译→' + (c && c.lang ? langShort(c.lang) : 'AUTO'), c && c.lang ? '#008069' : '#64748b');
+        if (c && c.lang) setBtnLang(langShort(c.lang), '#008069');
+        else setBtnLang('AUTO', '#64748b');
     }
 
-    // 语言选择小按钮（贴在"译"左边）
+    // 语言选择小按钮（圆形，和"译"同尺寸；大倒三角，一眼看出是下拉）
     var langBtn = document.createElement('div');
     langBtn.id = 'wa-tr-lang';
-    langBtn.textContent = '语言▾';
-    langBtn.style.cssText = 'position:fixed;left:0;top:0;z-index:2147483647;background:#334155;color:#fff;font:600 12px -apple-system,sans-serif;padding:9px 10px;border-radius:10px;cursor:pointer;box-shadow:0 4px 14px rgba(0,0,0,.35);user-select:none;white-space:nowrap;display:none;';
+    langBtn.title = '选择目标语言';
+    langBtn.style.cssText = 'position:fixed;left:0;top:0;z-index:2147483647;background:#1f2c33;' +
+        'border:2px solid rgba(255,255,255,.28);color:#fff;width:42px;height:42px;border-radius:50%;' +
+        'cursor:pointer;box-shadow:0 4px 14px rgba(0,0,0,.35);user-select:none;box-sizing:border-box;' +
+        'display:none;padding:0;align-items:center;justify-content:center;' +
+        'transition:transform .12s ease, filter .12s ease;';
+    langBtn.innerHTML =
+        '<span id="wa-tr-tri" style="display:flex;align-items:center;justify-content:center;line-height:0;transition:transform .16s ease;">' +
+        '<svg width="22" height="15" viewBox="0 0 22 15" aria-hidden="true">' +
+        '<path d="M11 14.2 L1.6 2.4 A1.9 1.9 0 0 1 3.4 1.1 L18.6 1.1 A1.9 1.9 0 0 1 20.4 2.4 Z" fill="#fff" stroke="#fff" stroke-width="1.6" stroke-linejoin="round"/>' +
+        '</svg></span>';
+    // 三角元素在 langBtn.querySelector('#wa-tr-tri')（开合时翻转 180°）
+    langBtn.onmouseenter = function () { langBtn.style.filter = 'brightness(1.18)'; };
+    langBtn.onmouseleave = function () { langBtn.style.filter = ''; };
+    langBtn.onmousedown = function () { langBtn.style.transform = 'scale(.92)'; };
+    langBtn.onmouseup = function () { langBtn.style.transform = ''; };
+    btn.title = '把输入框中文翻译成目标语言';
 
     var menu = document.createElement('div');
     menu.id = 'wa-tr-menu';
@@ -428,7 +480,7 @@
             el.onmouseleave = function () { if (el.style.background === '#f1f5f9' || el.style.background === 'rgb(241, 245, 249)') el.style.background = ''; };
             el.onclick = function () {
                 var v = el.getAttribute('data-v');
-                menu.style.display = 'none';
+                closeLangMenu();
                 if (v === 'settings') { openSettings(); return; }
                 if (v === 'redetect') {
                     delete S.chatLang[k]; saveCfg();
@@ -515,18 +567,28 @@
 
     langBtn.onclick = function (e) {
         e.stopPropagation();
-        if (menu.style.display === 'block') { menu.style.display = 'none'; return; }
+        var open = menu.style.display === 'block';
+        if (open) { closeLangMenu(); return; }
         buildMenu();
         menu.style.display = 'block';
-        var r = btn.getBoundingClientRect();
+        var r = langBtn.getBoundingClientRect();
         var mw = menu.offsetWidth || 250, mh = menu.offsetHeight || 400;
         menu.style.right = 'auto';
         menu.style.bottom = 'auto';
-        menu.style.left = Math.max(8, Math.min(r.left, window.innerWidth - mw - 8)) + 'px';
+        menu.style.left = Math.max(8, Math.min(r.left + r.width - mw, window.innerWidth - mw - 8)) + 'px';
         menu.style.top = Math.max(8, r.top - mh - 10) + 'px';
+        var tri = langBtn.querySelector('#wa-tr-tri');
+        if (tri) { tri.style.transform = 'rotate(180deg)'; }
+        langBtn.style.background = '#008069';
     };
+    function closeLangMenu() {
+        menu.style.display = 'none';
+        var tri = langBtn.querySelector('#wa-tr-tri');
+        if (tri) { tri.style.transform = ''; }
+        langBtn.style.background = '#1f2c33';
+    }
     document.addEventListener('mousedown', function (e) {
-        if (menu.style.display === 'block' && !menu.contains(e.target) && e.target !== langBtn) menu.style.display = 'none';
+        if (menu.style.display === 'block' && !menu.contains(e.target) && !langBtn.contains(e.target)) closeLangMenu();
     });
 
     document.body.appendChild(langBtn);
@@ -535,6 +597,18 @@
     paintBtn();
 
     /* ================= 跟随输入框定位（面板开关/窗口缩放自适应） ================= */
+    // 输入区里所有可见按钮（用来找最靠右的“发送”）
+    function footerButtons() {
+        var f = document.querySelector('#main footer'), out = [];
+        if (!f) return out;
+        var list = f.querySelectorAll('button'), best = null;
+        for (var i = 0; i < list.length; i++) {
+            var r = list[i].getBoundingClientRect();
+            if (r.width > 8 && r.height > 8 && (!best || r.left > best.r.left)) best = { el: list[i], r: r };
+        }
+        if (best) out.push(best);
+        return out;
+    }
     function anchorRect() {
         // 返回 {x: 按钮右侧贴靠的横坐标, mid: 垂直中线}
         var send = findSendIcon();
@@ -542,6 +616,11 @@
         if (b) {
             var r = b.getBoundingClientRect();
             if (r.width && r.height) return { x: r.left, mid: r.top + r.height / 2 };
+        }
+        var fb = footerButtons();
+        if (fb.length) {
+            var lr = fb[0].r;
+            return { x: lr.left, mid: lr.top + lr.height / 2 };
         }
         var ed = findEditor();
         if (ed) {
@@ -558,12 +637,13 @@
     function placeBar() {
         var a = anchorRect();
         if (!a) { btn.style.display = 'none'; langBtn.style.display = 'none'; return; }
-        btn.style.display = 'block';
-        langBtn.style.display = 'block';
-        var gap = 8;
-        var w1 = btn.offsetWidth || 74, h1 = btn.offsetHeight || 34;
-        var w2 = langBtn.offsetWidth || 62, h2 = langBtn.offsetHeight || 34;
-        var l1 = Math.max(6, a.x - gap - w1);
+        btn.style.display = 'flex';
+        langBtn.style.display = 'flex';
+        var gap = 3;            // 紧贴发送键，整体尽量靠右
+        var shift = 2;          // 再往右挪一点点
+        var w1 = btn.offsetWidth || 42, h1 = btn.offsetHeight || 42;
+        var w2 = langBtn.offsetWidth || 42, h2 = langBtn.offsetHeight || 42;
+        var l1 = Math.max(6, a.x + shift - gap - w1);
         var l2 = Math.max(6, l1 - gap - w2);
         btn.style.left = l1 + 'px';
         btn.style.top = Math.round(a.mid - h1 / 2) + 'px';
@@ -672,7 +752,7 @@
 
     /* ================= 加载提示 ================= */
     var toast = document.createElement('div');
-    toast.textContent = 'WA翻译助手 v4.0.5 已加载 ✓ 点多语言切换 → 自动跟客户';
+    toast.textContent = 'WA翻译助手 v4.1.2 已加载 ✓ 点多语言切换 → 自动跟客户';
     toast.style.cssText = 'position:fixed;left:16px;bottom:16px;z-index:2147483647;background:#111b27;color:#4ade80;font:600 12px/1.6 -apple-system,sans-serif;padding:8px 14px;border-radius:8px;box-shadow:0 4px 12px rgba(0,0,0,.35);';
     document.body.appendChild(toast);
     setTimeout(function () { toast.style.display = 'none'; }, 4000);
