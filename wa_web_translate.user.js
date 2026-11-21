@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         WhatsApp Web 翻译助手
 // @namespace    wa-translate
-// @version      4.1.2
+// @version      4.1.5
 // @description  中文→多国语言：按客户自动识别语种，输入框一键翻译+发送；划词翻译。零依赖，不装服务。
 // @match        https://web.whatsapp.com/*
 // @grant        GM_xmlhttpRequest
@@ -75,10 +75,25 @@
     function saveCfg() { GM_setValue('cfg4', S); }
 
     /* ================= 翻译接口 ================= */
-    function gmGet(url) {
+    function gmGet(url, timeout) {
         return new Promise(function (resolve, reject) {
             GM_xmlhttpRequest({
-                method: 'GET', url: url, timeout: 10000,
+                method: 'GET', url: url, timeout: timeout || 10000,
+                onload: function (r) {
+                    if (r.status >= 200 && r.status < 300) resolve(r.responseText);
+                    else reject('HTTP ' + r.status);
+                },
+                onerror: function () { reject('网络错误'); },
+                ontimeout: function () { reject('超时'); }
+            });
+        });
+    }
+    function gmPostForm(url, body, timeout) {
+        return new Promise(function (resolve, reject) {
+            GM_xmlhttpRequest({
+                method: 'POST', url: url, timeout: timeout || 8000,
+                headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+                data: body,
                 onload: function (r) {
                     if (r.status >= 200 && r.status < 300) resolve(r.responseText);
                     else reject('HTTP ' + r.status);
@@ -122,23 +137,60 @@
         if (!out) throw new Error('empty');
         return out;
     }
+    // MyMemory 出错时同样返回 HTTP 200，把错误文案塞进 translatedText，
+    // 例如 en|en 会返回 "PLEASE SELECT TWO DISTINCT LANGUAGES" —— 必须识别成失败，不能当译文用
+    var MM_ERR = /PLEASE SELECT TWO DISTINCT LANGUAGES|IS AN INVALID SOURCE LANGUAGE|INVALID (SOURCE|TARGET) LANGUAGE|MYMEMORY WARNING|TOO MANY REQUESTS|NO QUERY SPECIFIED/i;
     function parseMM(json) {
         var j = JSON.parse(json);
         var t = j.responseData && j.responseData.translatedText;
         if (!t) throw new Error('mymemory:empty');
+        if (MM_ERR.test(t)) throw new Error('mymemory:' + String(t).slice(0, 60));
         return t;
     }
-    // 免费机翻：Google 主，MyMemory 兜底
+    // Google 另一个端点（translate_a/single），比 clients5 稳、支持长文本，作为首选
+    function gSingle(text, sl, tl) {
+        return gmPostForm('https://translate.googleapis.com/translate_a/single',
+            'client=gtx&sl=' + sl + '&tl=' + tl + '&dt=t&q=' + encodeURIComponent(text), 6000)
+            .then(function (r) {
+                var j = JSON.parse(r), seg = j && j[0];
+                if (!Array.isArray(seg)) throw new Error('single:bad');
+                var out = '';
+                for (var i = 0; i < seg.length; i++) { if (seg[i] && seg[i][0]) out += seg[i][0]; }
+                out = out.trim();
+                if (!out) throw new Error('single:empty');
+                return out;
+            });
+    }
+    // 译文内存缓存：同一段文字反复点"译"不再重新请求（最多 200 条）
+    var mtCache = {}, mtKeys = [];
+    function mtCached(k, v) {
+        if (mtCache[k] === undefined) {
+            mtCache[k] = v; mtKeys.push(k);
+            if (mtKeys.length > 200) { delete mtCache[mtKeys.shift()]; }
+        }
+        return mtCache[k];
+    }
+    // 免费机翻：Google 两个端点 → MyMemory 兜底
     function mtTranslate(text, sl, tl) {
         var q = encodeURIComponent(text);
-        return gmGet('https://clients5.google.com/translate_a/t?client=dict-chrome-ex&sl=' + sl + '&tl=' + tl + '&q=' + q)
-            .then(parseDict)
+        var ck = sl + '|' + tl + '|' + text;
+        if (mtCache[ck] !== undefined) return Promise.resolve(mtCache[ck]);
+        // 同语种直接返回，省一次网络往返
+        var src0 = (sl && sl !== 'auto') ? sl : detectLang([text]);
+        if (src0 && src0 === tl) return Promise.resolve(text);
+        return gSingle(text, sl, tl)
+            .catch(function () { return gmGet('https://clients5.google.com/translate_a/t?client=dict-chrome-ex&sl=' + sl + '&tl=' + tl + '&q=' + q, 4000).then(parseDict); })
             .catch(function (err1) {
-                var pair = sl === 'auto' ? 'en|' + tl : (sl + '|' + tl);
-                return gmGet('https://api.mymemory.translated.net/get?q=' + q + '&langpair=' + pair)
+                // 旧逻辑固定拿 en 当源语：目标语正好是英语时就变成 en|en，
+                // MyMemory 便返回 "PLEASE SELECT TWO DISTINCT LANGUAGES"。
+                var src = src0;
+                if (!src) throw new Error(err1 + ' / 源语种无法判定');
+                var pair = src + '|' + tl;
+                return gmGet('https://api.mymemory.translated.net/get?q=' + q + '&langpair=' + pair, 6000)
                     .then(parseMM)
                     .catch(function (err2) { throw new Error(err1 + ' / ' + err2); });
-            });
+            })
+            .then(function (res) { return mtCached(ck, res); });
     }
     // 可选：AI 翻译（外贸术语更准）
     function aiTranslate(text, tl) {
@@ -328,14 +380,35 @@
 
     /* ================= 输入框定位 ================= */
     function findEditor() {
-        var sels = [
-            'footer div[contenteditable="true"]',
-            'div[contenteditable="true"][spellcheck="true"]',
-            'div[contenteditable="true"][role="textbox"]',
-            'div[contenteditable="true"]'
-        ];
-        for (var i = 0; i < sels.length; i++) { var el = document.querySelector(sels[i]); if (el) return el; }
-        return null;
+        // 只在"可见"的编辑器里找：发图片/视频时聊天输入框仍在 DOM 里但已隐藏，
+        // 旧写法会抓到那个隐藏框 → 点"译"只提示"输入框为空"。
+        var list = document.querySelectorAll('[contenteditable="true"]'), vis = [];
+        for (var i = 0; i < list.length; i++) {
+            var el = list[i];
+            if (el.getAttribute('contenteditable') !== 'true') continue;
+            var r = el.getBoundingClientRect();
+            if (!r.width || !r.height) continue;
+            var st = null;
+            try { st = window.getComputedStyle(el); } catch (e) {}
+            if (st && (st.visibility === 'hidden' || st.display === 'none' || st.opacity === '0')) continue;
+            if (el.closest('[aria-hidden="true"]')) continue;
+            vis.push(el);
+        }
+        if (!vis.length) return null;
+        // 1) 正在编辑的那个（图片说明文字框就是靠这条命中）
+        var ae = document.activeElement;
+        if (ae && ae.getAttribute && ae.getAttribute('contenteditable') === 'true' && vis.indexOf(ae) >= 0) return ae;
+        var sel = window.getSelection && window.getSelection();
+        if (sel && sel.rangeCount && sel.anchorNode) {
+            var host = sel.anchorNode.nodeType === 1 ? sel.anchorNode : sel.anchorNode.parentNode;
+            var ce = host && host.closest ? host.closest('[contenteditable="true"]') : null;
+            if (ce && vis.indexOf(ce) >= 0) return ce;
+        }
+        // 2) 常规聊天输入框
+        var f = document.querySelector('#main footer');
+        if (f) { for (var j = 0; j < vis.length; j++) if (f.contains(vis[j])) return vis[j]; }
+        // 3) 兜底：最后一个可见的（媒体预览层挂在 DOM 末尾）
+        return vis[vis.length - 1];
     }
 
     /* ================= 替换输入框内容（Lexical 注入，沿用 v3.16 验证过的链路） ================= */
@@ -398,8 +471,21 @@
     }
 
     /* ================= 发送 ================= */
+    function isVis(el) {
+        if (!el || !el.getBoundingClientRect) return false;
+        var r = el.getBoundingClientRect();
+        if (r.width < 10 || r.height < 10) return false;
+        if (r.bottom < 0 || r.top > innerHeight || r.right < 0 || r.left > innerWidth) return false;
+        var st = null;
+        try { st = window.getComputedStyle(el); } catch (e) {}
+        if (st && (st.visibility === 'hidden' || st.display === 'none' || st.opacity === '0')) return false;
+        return true;
+    }
     function findSendIcon() {
-        return document.querySelector('span[data-icon="wds-ic-send-filled"]') || document.querySelector('span[data-icon="send"]');
+        // 发图片时聊天输入区的发送键还在 DOM 里但已隐藏，必须取"看得见"的那个
+        var list = document.querySelectorAll('span[data-icon="wds-ic-send-filled"], span[data-icon="send"]');
+        for (var i = list.length - 1; i >= 0; i--) if (isVis(list[i])) return list[i];
+        return null;
     }
     function sendMessage() {
         var icon = findSendIcon();
@@ -443,7 +529,7 @@
     langBtn.id = 'wa-tr-lang';
     langBtn.title = '选择目标语言';
     langBtn.style.cssText = 'position:fixed;left:0;top:0;z-index:2147483647;background:#1f2c33;' +
-        'border:2px solid rgba(255,255,255,.28);color:#fff;width:42px;height:42px;border-radius:50%;' +
+        'color:#fff;width:42px;height:42px;border-radius:50%;' +
         'cursor:pointer;box-shadow:0 4px 14px rgba(0,0,0,.35);user-select:none;box-sizing:border-box;' +
         'display:none;padding:0;align-items:center;justify-content:center;' +
         'transition:transform .12s ease, filter .12s ease;';
@@ -455,9 +541,11 @@
     // 三角元素在 langBtn.querySelector('#wa-tr-tri')（开合时翻转 180°）
     langBtn.onmouseenter = function () { langBtn.style.filter = 'brightness(1.18)'; };
     langBtn.onmouseleave = function () { langBtn.style.filter = ''; };
-    langBtn.onmousedown = function () { langBtn.style.transform = 'scale(.92)'; };
+    langBtn.onmousedown = function (e) { if (e) e.preventDefault(); langBtn.style.transform = 'scale(.92)'; };
     langBtn.onmouseup = function () { langBtn.style.transform = ''; };
     btn.title = '把输入框中文翻译成目标语言';
+    // 点在按钮上不要抢走输入框焦点/选区（图片说明文字框尤其需要）
+    btn.addEventListener('mousedown', function (e) { e.preventDefault(); });
 
     var menu = document.createElement('div');
     menu.id = 'wa-tr-menu';
@@ -603,19 +691,21 @@
         if (!f) return out;
         var list = f.querySelectorAll('button'), best = null;
         for (var i = 0; i < list.length; i++) {
+            if (!isVis(list[i])) continue;
             var r = list[i].getBoundingClientRect();
-            if (r.width > 8 && r.height > 8 && (!best || r.left > best.r.left)) best = { el: list[i], r: r };
+            if (!best || r.left > best.r.left) best = { el: list[i], r: r };
         }
         if (best) out.push(best);
         return out;
     }
     function anchorRect() {
-        // 返回 {x: 按钮右侧贴靠的横坐标, mid: 垂直中线}
+        // 返回 {x: 两按钮右边缘贴靠的横坐标, mid: 垂直中线(取发送图标的视觉中心)}
         var send = findSendIcon();
-        var b = send && send.closest('button');
-        if (b) {
-            var r = b.getBoundingClientRect();
-            if (r.width && r.height) return { x: r.left, mid: r.top + r.height / 2 };
+        if (send && isVis(send)) {
+            var ir = send.getBoundingClientRect();
+            var b = send.closest('button');
+            var br = (b && isVis(b)) ? b.getBoundingClientRect() : ir;
+            return { x: Math.min(ir.left, br.left), mid: ir.top + ir.height / 2 };
         }
         var fb = footerButtons();
         if (fb.length) {
@@ -628,7 +718,7 @@
             if (r2.width) return { x: r2.right - 56, mid: r2.top + r2.height / 2 };   // 给发送键留位
         }
         var f = document.querySelector('#main footer');
-        if (f) {
+        if (f && isVis(f)) {
             var r3 = f.getBoundingClientRect();
             if (r3.width) return { x: r3.right - 56, mid: r3.top + r3.height / 2 };
         }
@@ -639,16 +729,40 @@
         if (!a) { btn.style.display = 'none'; langBtn.style.display = 'none'; return; }
         btn.style.display = 'flex';
         langBtn.style.display = 'flex';
-        var gap = 3;            // 紧贴发送键，整体尽量靠右
-        var shift = 2;          // 再往右挪一点点
+
+        var GAP = 8;            // 三角 与 译 之间
+        var BEFORE = 12;        // 译 与 发送键 之间
         var w1 = btn.offsetWidth || 42, h1 = btn.offsetHeight || 42;
         var w2 = langBtn.offsetWidth || 42, h2 = langBtn.offsetHeight || 42;
-        var l1 = Math.max(6, a.x + shift - gap - w1);
-        var l2 = Math.max(6, l1 - gap - w2);
-        btn.style.left = l1 + 'px';
+
+        // 第一次按尺寸计算
+        btn.style.left = Math.max(6, Math.round(a.x - BEFORE - w1)) + 'px';
         btn.style.top = Math.round(a.mid - h1 / 2) + 'px';
-        langBtn.style.left = l2 + 'px';
+        langBtn.style.left = Math.max(6, Math.round(a.x - BEFORE - w1 - GAP - w2)) + 'px';
         langBtn.style.top = Math.round(a.mid - h2 / 2) + 'px';
+
+        // 第二次按"真实渲染位置"收口：不管 offset/transform 怎么漂，
+        // 最终间距一定均匀（图片预览模式发送键尺寸不一样，也不会错位）
+        try {
+            var r1 = btn.getBoundingClientRect(), r2 = langBtn.getBoundingClientRect();
+            var d1 = (a.x - BEFORE) - r1.right;
+            if (Math.abs(d1) >= 1) {
+                btn.style.left = Math.round(parseFloat(btn.style.left) + d1) + 'px';
+                r1 = btn.getBoundingClientRect();
+            }
+            var d2 = (r1.left - GAP) - r2.right;
+            if (Math.abs(d2) >= 1) {
+                langBtn.style.left = Math.round(parseFloat(langBtn.style.left) + d2) + 'px';
+            }
+            var dm = a.mid - (r1.top + r1.height / 2);
+            if (Math.abs(dm) >= 1) {
+                btn.style.top = Math.round(parseFloat(btn.style.top) + dm) + 'px';
+                langBtn.style.top = Math.round(parseFloat(langBtn.style.top) + dm) + 'px';
+            }
+            // 窗口太窄时宁可挤在一起，也不能跑到屏幕外
+            if (parseFloat(btn.style.left) < 6) btn.style.left = '6px';
+            if (parseFloat(langBtn.style.left) < 6) langBtn.style.left = '6px';
+        } catch (e) {}
     }
     var _ro = null;
     function watchComposer() {
@@ -752,7 +866,7 @@
 
     /* ================= 加载提示 ================= */
     var toast = document.createElement('div');
-    toast.textContent = 'WA翻译助手 v4.1.2 已加载 ✓ 点多语言切换 → 自动跟客户';
+    toast.textContent = 'WA翻译助手 v4.1.5 已加载 ✓ 点多语言切换 → 自动跟客户';
     toast.style.cssText = 'position:fixed;left:16px;bottom:16px;z-index:2147483647;background:#111b27;color:#4ade80;font:600 12px/1.6 -apple-system,sans-serif;padding:8px 14px;border-radius:8px;box-shadow:0 4px 12px rgba(0,0,0,.35);';
     document.body.appendChild(toast);
     setTimeout(function () { toast.style.display = 'none'; }, 4000);
